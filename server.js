@@ -120,6 +120,29 @@ async function initDb() {
     );
   `);
 
+  // v1.6.3 MIGRATION FIX:
+  // v1.6.0 created audit_log with BIGSERIAL id and columns entity_type/entity_id/payload.
+  // v1.6.1/v1.6.2 expects TEXT id and actor_user_id/target_type/target_id/details_json.
+  // If the old table exists, preserve it as audit_log_legacy_v160 and create a new compatible audit_log.
+  await query(`
+    DO $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name='audit_log' AND column_name='id' AND data_type <> 'text'
+      ) THEN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.tables
+          WHERE table_name='audit_log_legacy_v160'
+        ) THEN
+          ALTER TABLE audit_log RENAME TO audit_log_legacy_v160;
+        ELSE
+          DROP TABLE audit_log;
+        END IF;
+      END IF;
+    END $$;
+  `);
+
   await query(`
     CREATE TABLE IF NOT EXISTS audit_log (
       id TEXT PRIMARY KEY,
@@ -148,6 +171,27 @@ async function initDb() {
 
   await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS employee_id TEXT;`);
   await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE;`);
+
+  // v1.6.3: upgrade old overtime_rules table from v1.6.0 if it only had rules JSONB.
+  await query(`ALTER TABLE overtime_rules ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();`);
+  await query(`ALTER TABLE overtime_rules ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();`);
+  await query(`ALTER TABLE overtime_rules ADD COLUMN IF NOT EXISTS normal_rate NUMERIC NOT NULL DEFAULT 160;`);
+  await query(`ALTER TABLE overtime_rules ADD COLUMN IF NOT EXISTS overtime_rate NUMERIC NOT NULL DEFAULT 220;`);
+  await query(`ALTER TABLE overtime_rules ADD COLUMN IF NOT EXISTS customer_rate NUMERIC NOT NULL DEFAULT 320;`);
+  await query(`ALTER TABLE overtime_rules ADD COLUMN IF NOT EXISTS overtime_after_hours NUMERIC NOT NULL DEFAULT 8;`);
+  await query(`ALTER TABLE overtime_rules ADD COLUMN IF NOT EXISTS night_start TEXT NOT NULL DEFAULT '22:00';`);
+  await query(`ALTER TABLE overtime_rules ADD COLUMN IF NOT EXISTS night_end TEXT NOT NULL DEFAULT '06:00';`);
+  await query(`ALTER TABLE overtime_rules ADD COLUMN IF NOT EXISTS night_overtime_enabled BOOLEAN NOT NULL DEFAULT TRUE;`);
+
+  // v1.6.3: upgrade old payslips table from v1.6.0.
+  await query(`ALTER TABLE payslips ADD COLUMN IF NOT EXISTS period TEXT NOT NULL DEFAULT '';`);
+  await query(`ALTER TABLE payslips ADD COLUMN IF NOT EXISTS data_json JSONB NOT NULL DEFAULT '{}'::jsonb;`);
+
+  // v1.6.3: make sure audit_log has all new columns before indexes/inserts.
+  await query(`ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS actor_user_id TEXT NOT NULL DEFAULT 'system';`);
+  await query(`ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS target_type TEXT NOT NULL DEFAULT 'system';`);
+  await query(`ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS target_id TEXT NOT NULL DEFAULT '';`);
+  await query(`ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS details_json JSONB NOT NULL DEFAULT '{}'::jsonb;`);
 
   await query(`CREATE INDEX IF NOT EXISTS idx_time_entries_user_id ON time_entries(user_id);`);
   await query(`CREATE INDEX IF NOT EXISTS idx_time_entries_employee_id ON time_entries(employee_id);`);
@@ -250,13 +294,13 @@ app.get("/", async (req, res) => {
   } catch (_) {
     database = "disconnected";
   }
-  res.json({ ok: true, app: "Pengedag Backend Login", version: "1.6.2-login-migrationfix", database });
+  res.json({ ok: true, app: "Pengedag Backend Login", version: "1.6.3-auditlog-migrationfix", database });
 });
 
 app.get("/health", async (req, res) => {
   try {
     await query("SELECT 1");
-    res.json({ ok: true, app: "Pengedag Backend Login", version: "1.6.2-login-migrationfix", database: "postgresql" });
+    res.json({ ok: true, app: "Pengedag Backend Login", version: "1.6.3-auditlog-migrationfix", database: "postgresql" });
   } catch (err) {
     res.status(500).json({ ok: false, app: "Pengedag Backend Login", database: "disconnected", error: err.message });
   }
@@ -265,7 +309,7 @@ app.get("/health", async (req, res) => {
 app.get("/api/mobile/routes", (req, res) => {
   res.json({
     ok: true,
-    version: "1.6.2-login-migrationfix",
+    version: "1.6.3-auditlog-migrationfix",
     auth: "Bearer token required on protected routes",
     routes: [
       "POST /api/auth/bootstrap-admin",
