@@ -11,7 +11,7 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '15mb' }));
 
-const VERSION = '1.6.8-bilag-audit-log-fix';
+const VERSION = '1.6.9-bilag-audit-strict-fix';
 const PORT = process.env.PORT || 8080;
 const JWT_SECRET = process.env.JWT_SECRET || 'DEV_ONLY_CHANGE_ME_PENGEDAG';
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -361,54 +361,51 @@ function calcHours(start, end, pauseMinutes) {
 }
 
 async function audit(actor, action, targetType, targetId, details = {}) {
-  try {
-    const latest = await query(`SELECT sequence_number, row_hash FROM audit_log ORDER BY sequence_number DESC, created_at DESC LIMIT 1`);
-    const lastSeq = latest.rows.length ? Number(latest.rows[0].sequence_number || 0) : 0;
-    const prevHash = latest.rows.length ? (latest.rows[0].row_hash || 'GENESIS') : 'GENESIS';
+  const latest = await query(`SELECT sequence_number, row_hash FROM audit_log ORDER BY sequence_number DESC, created_at DESC LIMIT 1`);
+  const lastSeq = latest.rows.length ? Number(latest.rows[0].sequence_number || 0) : 0;
+  const prevHash = latest.rows.length ? (latest.rows[0].row_hash || 'GENESIS') : 'GENESIS';
 
-    // v1.6.8 fix:
-    // Nogle gamle Pengedag-databaser har audit_log.id som INTEGER/SERIAL,
-    // mens nyere versioner opretter id som TEXT. Hvis vi altid bruger
-    // makeId('audit'), fejler INSERT lydloest paa gamle databaser.
-    // Derfor vaelger vi id-type dynamisk, saa alle nye handlinger igen
-    // kommer med i den immutable audit-log.
-    const idTypeResult = await query(`
-      SELECT data_type
-      FROM information_schema.columns
-      WHERE table_name='audit_log' AND column_name='id'
-      LIMIT 1
-    `);
-    const idType = idTypeResult.rows[0]?.data_type || 'text';
-    let id;
-    if (['integer', 'bigint', 'smallint', 'numeric'].includes(idType)) {
-      const nextId = await query(`SELECT COALESCE(MAX(id), 0) + 1 AS next_id FROM audit_log`);
-      id = Number(nextId.rows[0]?.next_id || 1);
-    } else {
-      id = makeId('audit');
-    }
+  const idTypeResult = await query(`
+    SELECT data_type, column_default
+    FROM information_schema.columns
+    WHERE table_name='audit_log' AND column_name='id'
+    LIMIT 1
+  `);
+  const idType = idTypeResult.rows[0]?.data_type || 'text';
+  const columnDefault = idTypeResult.rows[0]?.column_default || '';
+  const numericId = ['integer', 'bigint', 'smallint', 'numeric'].includes(idType);
+  const createdAt = new Date();
 
-    const createdAt = new Date();
-    const row = {
-      id,
-      actor_user_id: actor?.id || '',
-      actor_email: actor?.email || '',
-      actor_role: actor?.role || '',
-      sequence_number: lastSeq + 1,
-      prev_hash: prevHash,
-      action,
-      target_type: targetType || '',
-      target_id: targetId || '',
-      details_json: details || {},
-      created_at: createdAt
-    };
-    row.row_hash = buildAuditHash(row);
+  const row = {
+    id: numericId ? null : makeId('audit'),
+    actor_user_id: actor?.id || '',
+    actor_email: actor?.email || '',
+    actor_role: actor?.role || '',
+    sequence_number: lastSeq + 1,
+    prev_hash: prevHash,
+    action,
+    target_type: targetType || '',
+    target_id: targetId || '',
+    details_json: details || {},
+    created_at: createdAt
+  };
+  row.row_hash = buildAuditHash(row);
+
+  // v1.6.9: Gamle databaser har ofte audit_log.id som SERIAL/INTEGER.
+  // Her lader vi PostgreSQL selv lave id'et, så INSERT ikke fejler på id-type eller sekvens.
+  // Hvis id er TEXT, bruger vi vores eget audit-id.
+  if (numericId || columnDefault.includes('nextval')) {
+    await query(
+      `INSERT INTO audit_log (actor_user_id, actor_email, actor_role, sequence_number, prev_hash, row_hash, action, target_type, target_id, details_json, created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+      [row.actor_user_id, row.actor_email, row.actor_role, row.sequence_number, row.prev_hash, row.row_hash, action, row.target_type, row.target_id, row.details_json, createdAt]
+    );
+  } else {
     await query(
       `INSERT INTO audit_log (id, actor_user_id, actor_email, actor_role, sequence_number, prev_hash, row_hash, action, target_type, target_id, details_json, created_at)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
-      [id, row.actor_user_id, row.actor_email, row.actor_role, row.sequence_number, row.prev_hash, row.row_hash, action, row.target_type, row.target_id, row.details_json, createdAt]
+      [row.id, row.actor_user_id, row.actor_email, row.actor_role, row.sequence_number, row.prev_hash, row.row_hash, action, row.target_type, row.target_id, row.details_json, createdAt]
     );
-  } catch (e) {
-    console.warn('Audit log kunne ikke gemmes:', e.message);
   }
 }
 
@@ -634,7 +631,12 @@ app.post('/api/bilag/upload', auth, async (req, res) => {
     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
     [id, req.user.id, req.user.email, req.user.role, filename, mimeType, buffer.length, hash, 'postgres_bytea', linkedType, linkedId, buffer]
   );
-  await audit(req.user, 'CREATE_BILAG', 'bilag', id, { filename, mimeType, fileSize: buffer.length, sha256: hash, linkedType, linkedId, storageKind: 'postgres_bytea' });
+  try {
+    await audit(req.user, 'CREATE_BILAG', 'bilag', id, { filename, mimeType, fileSize: buffer.length, sha256: hash, linkedType, linkedId, storageKind: 'postgres_bytea' });
+  } catch (e) {
+    console.error('KRITISK: Bilag blev gemt, men audit-log fejlede:', e.message);
+    return res.status(500).json({ ok: false, error: 'Bilag blev gemt, men audit-log fejlede', auditError: e.message, attachmentId: id });
+  }
   res.json({ ok: true, attachment: { id, filename, mimeType, fileSize: buffer.length, sha256: hash, linkedType, linkedId, storageKind: 'postgres_bytea' } });
 });
 
