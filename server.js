@@ -70,7 +70,7 @@ app.use(cors({
 }));
 app.use(express.json({ limit: JSON_LIMIT }));
 
-const VERSION = '1.6.17-skift-adgangskode';
+const VERSION = '1.6.18-medarbejder-dashboard';
 const PORT = process.env.PORT || 8080;
 const JWT_SECRET = process.env.JWT_SECRET || 'DEV_ONLY_CHANGE_ME_PENGEDAG';
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -567,7 +567,7 @@ app.get('/health', async (req, res) => {
 
 app.get('/api/mobile/routes', (req, res) => res.json({ ok: true, version: VERSION, routes: [
   'GET /health', 'POST /api/auth/bootstrap-admin', 'POST /api/auth/login', 'GET /api/auth/me', 'POST /api/auth/change-password', 'POST /api/auth/users',
-  'POST /api/mobile/time-entry', 'GET /api/mobile/times', 'POST /api/mobile/time-entries/:id/approve', 'POST /api/mobile/time-entries/:id/reject', 'POST /api/bilag/upload', 'GET /api/bilag', 'GET /api/bilag/:id', 'GET /api/bilag/:id/download', 'GET /api/admin/backup/export', 'POST /api/admin/backup/restore', 'GET /api/admin/revisor/export', 'GET /api/admin/saft/preview', 'GET /api/legal/gdpr', 'GET /api/legal/dpa', 'GET /api/gdpr/my-data', 'GET /api/admin/gdpr/export-user/:userId', 'POST /api/admin/gdpr/record-request', 'GET /api/admin/audit-log', 'GET /api/admin/audit-log/verify', 'GET /api/admin/security/status', 'POST /api/admin/security/record-check'
+  'POST /api/mobile/time-entry', 'GET /api/mobile/times', 'GET /api/employee/dashboard', 'POST /api/mobile/time-entries/:id/approve', 'POST /api/mobile/time-entries/:id/reject', 'POST /api/bilag/upload', 'GET /api/bilag', 'GET /api/bilag/:id', 'GET /api/bilag/:id/download', 'GET /api/admin/backup/export', 'POST /api/admin/backup/restore', 'GET /api/admin/revisor/export', 'GET /api/admin/saft/preview', 'GET /api/legal/gdpr', 'GET /api/legal/dpa', 'GET /api/gdpr/my-data', 'GET /api/admin/gdpr/export-user/:userId', 'POST /api/admin/gdpr/record-request', 'GET /api/admin/audit-log', 'GET /api/admin/audit-log/verify', 'GET /api/admin/security/status', 'POST /api/admin/security/record-check'
 ]}));
 
 app.get('/api/admin/security/status', auth, requireRole('admin','auditor'), async (req, res) => {
@@ -703,6 +703,65 @@ app.get(['/api/mobile/times','/api/mobile/time-entries','/api/mobile/timesheets'
     pauseMinutes: x.pause_minutes, note: x.note, status: x.status, calculation: x.calculation_json, createdAt: x.created_at
   }));
   res.json({ ok: true, count: entries.length, entries });
+});
+
+
+app.get('/api/employee/dashboard', auth, async (req, res) => {
+  // Samlet endpoint til medarbejder-dashboardet. Medarbejdere ser kun egne data.
+  let timeRows;
+  if (req.user.role === 'employee') {
+    timeRows = await query('SELECT * FROM time_entries WHERE user_id=$1 OR employee_id=$2 ORDER BY created_at DESC LIMIT 200', [req.user.id, req.user.employee_id || '']);
+  } else {
+    timeRows = await query('SELECT * FROM time_entries ORDER BY created_at DESC LIMIT 200');
+  }
+
+  const timeIds = timeRows.rows.map(x => x.id);
+  let attachmentRows = { rows: [] };
+  if (timeIds.length) {
+    attachmentRows = await query(`SELECT id,original_filename,mime_type,file_size,sha256,linked_type,linked_id,created_at
+      FROM attachments
+      WHERE linked_type='time_entry' AND linked_id = ANY($1::text[])
+      ORDER BY created_at DESC LIMIT 200`, [timeIds]);
+  }
+
+  const entries = timeRows.rows.map(x => ({
+    id: x.id,
+    employeeId: x.employee_id,
+    employeeName: x.employee_name,
+    date: x.date,
+    start: x.start_time,
+    end: x.end_time,
+    pauseMinutes: x.pause_minutes,
+    note: x.note,
+    status: x.status,
+    calculation: x.calculation_json,
+    createdAt: x.created_at
+  }));
+
+  const attachments = attachmentRows.rows.map(x => ({
+    id: x.id,
+    filename: x.original_filename,
+    mimeType: x.mime_type,
+    fileSize: x.file_size,
+    sha256: x.sha256,
+    linkedType: x.linked_type,
+    linkedId: x.linked_id,
+    createdAt: x.created_at
+  }));
+
+  res.json({
+    ok: true,
+    user: { id: req.user.id, email: req.user.email, role: req.user.role, employeeId: req.user.employee_id || '', name: req.user.name || '' },
+    summary: {
+      timeEntries: entries.length,
+      attachments: attachments.length,
+      pending: entries.filter(x => x.status === 'Afventer').length,
+      approved: entries.filter(x => x.status === 'Godkendt').length,
+      rejected: entries.filter(x => x.status === 'Afvist').length
+    },
+    entries,
+    attachments
+  });
 });
 
 app.post('/api/mobile/time-entries/:id/approve', auth, requireRole('admin','owner'), async (req, res) => {
