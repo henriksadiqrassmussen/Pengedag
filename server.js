@@ -11,7 +11,7 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '15mb' }));
 
-const VERSION = '1.6.12-backup-export-restore';
+const VERSION = '1.6.13-revisor-saft-forberedelse';
 const PORT = process.env.PORT || 8080;
 const JWT_SECRET = process.env.JWT_SECRET || 'DEV_ONLY_CHANGE_ME_PENGEDAG';
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -508,7 +508,7 @@ app.get('/health', async (req, res) => {
 
 app.get('/api/mobile/routes', (req, res) => res.json({ ok: true, version: VERSION, routes: [
   'GET /health', 'POST /api/auth/bootstrap-admin', 'POST /api/auth/login', 'GET /api/auth/me', 'POST /api/auth/users',
-  'POST /api/mobile/time-entry', 'GET /api/mobile/times', 'POST /api/mobile/time-entries/:id/approve', 'POST /api/mobile/time-entries/:id/reject', 'POST /api/bilag/upload', 'GET /api/bilag', 'GET /api/bilag/:id', 'GET /api/bilag/:id/download', 'GET /api/admin/backup/export', 'POST /api/admin/backup/restore', 'GET /api/admin/audit-log', 'GET /api/admin/audit-log/verify'
+  'POST /api/mobile/time-entry', 'GET /api/mobile/times', 'POST /api/mobile/time-entries/:id/approve', 'POST /api/mobile/time-entries/:id/reject', 'POST /api/bilag/upload', 'GET /api/bilag', 'GET /api/bilag/:id', 'GET /api/bilag/:id/download', 'GET /api/admin/backup/export', 'POST /api/admin/backup/restore', 'GET /api/admin/revisor/export', 'GET /api/admin/saft/preview', 'GET /api/admin/audit-log', 'GET /api/admin/audit-log/verify'
 ]}));
 
 app.post('/api/auth/bootstrap-admin', async (req, res) => {
@@ -746,6 +746,178 @@ app.get('/api/bilag/:id/download', auth, async (req, res) => {
   res.send(x.file_data);
 });
 
+
+
+// v1.6.13: Revisor-eksport / SAF-T-forberedelse
+// Vigtigt: Dette er SAF-T-FORBEREDELSE, ikke en officiel Erhvervsstyrelsen-godkendt SAF-T fil.
+// Formaal: give revisor en samlet, kontrollerbar eksport med timer, bilag, loensedler, regler og audit-log.
+function csvEscape(value) {
+  if (value === null || value === undefined) return '';
+  const s = String(value);
+  if (/[";\n\r]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
+  return s;
+}
+
+function toCsv(rows, columns) {
+  const header = columns.map(c => csvEscape(c.label || c.key)).join(';');
+  const body = rows.map(row => columns.map(c => csvEscape(typeof c.value === 'function' ? c.value(row) : row[c.key])).join(';')).join('\n');
+  return header + (body ? '\n' + body : '');
+}
+
+function safeDateOnly(value) {
+  if (!value) return '';
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return String(value);
+  return d.toISOString().slice(0, 10);
+}
+
+function calcHoursForExport(row) {
+  if (row.hours !== undefined && row.hours !== null && row.hours !== '') return Number(row.hours) || 0;
+  const start = String(row.start_time || row.start || '');
+  const end = String(row.end_time || row.end || '');
+  const pause = Number(row.pause_minutes || row.pauseMinutes || 0) || 0;
+  const m = (t) => {
+    const parts = String(t).split(':').map(Number);
+    if (parts.length < 2 || Number.isNaN(parts[0]) || Number.isNaN(parts[1])) return null;
+    return parts[0] * 60 + parts[1];
+  };
+  const a = m(start), b = m(end);
+  if (a === null || b === null) return 0;
+  let diff = b - a;
+  if (diff < 0) diff += 24 * 60;
+  diff -= pause;
+  return Math.max(0, Math.round((diff / 60) * 100) / 100);
+}
+
+async function buildRevisorExport(reqUser) {
+  const data = await readAllForBackup();
+  const exportId = makeId('revisor_export');
+  const exportedAt = new Date().toISOString();
+
+  const timeEntries = data.time_entries || [];
+  const attachments = data.attachments || [];
+  const payslips = data.payslips || [];
+  const overtimeRules = data.overtime_rules || [];
+  const auditRows = data.audit_log_readonly || [];
+
+  const attachmentsByLinkedId = {};
+  for (const a of attachments) {
+    const key = String(a.linked_type || '') + ':' + String(a.linked_id || '');
+    if (!attachmentsByLinkedId[key]) attachmentsByLinkedId[key] = [];
+    attachmentsByLinkedId[key].push({ id: a.id, filename: a.original_filename, sha256: a.sha256, file_size: a.file_size });
+  }
+
+  const timeRows = timeEntries.map(t => ({
+    id: t.id,
+    date: safeDateOnly(t.date),
+    employee_id: t.employee_id || t.employeeId || '',
+    employee_name: t.employee_name || t.employeeName || '',
+    start: t.start_time || t.start || '',
+    end: t.end_time || t.end || '',
+    pause_minutes: t.pause_minutes || t.pauseMinutes || 0,
+    hours: calcHoursForExport(t),
+    status: t.status || '',
+    note: t.note || '',
+    attachments: attachmentsByLinkedId['time_entry:' + t.id] || []
+  }));
+
+  const summary = {
+    totalTimeEntries: timeRows.length,
+    totalHours: Math.round(timeRows.reduce((sum, x) => sum + (Number(x.hours) || 0), 0) * 100) / 100,
+    totalAttachments: attachments.length,
+    totalPayslips: payslips.length,
+    totalOvertimeRules: overtimeRules.length,
+    totalAuditRows: auditRows.length,
+    employees: Array.from(new Set(timeRows.map(x => x.employee_id).filter(Boolean))).length
+  };
+
+  const files = {
+    'README_REVISOR.txt': [
+      'Pengedag revisor-eksport',
+      'Eksport-id: ' + exportId,
+      'Eksporteret: ' + exportedAt,
+      'Backend: ' + VERSION,
+      '',
+      'Indhold:',
+      '- manifest.json: teknisk manifest, hash og optaellinger',
+      '- time_entries.csv: timesedler/timer',
+      '- attachments_index.csv: bilagsoversigt med SHA-256',
+      '- payslips.csv: loensedler',
+      '- overtime_rules.csv: overtidsregler',
+      '- audit_log.csv: immutable rettelseslog',
+      '- saft_preparation.json: SAF-T-forberedende datastruktur',
+      '',
+      'Bemærk: Dette er SAF-T-forberedelse og revisorpakke, ikke en officiel SAF-T XML-fil.'
+    ].join('\n'),
+    'time_entries.csv': toCsv(timeRows, [
+      { key: 'id' }, { key: 'date' }, { key: 'employee_id' }, { key: 'employee_name' },
+      { key: 'start' }, { key: 'end' }, { key: 'pause_minutes' }, { key: 'hours' }, { key: 'status' }, { key: 'note' },
+      { key: 'attachments', value: r => (r.attachments || []).map(a => a.id + ':' + a.filename).join('|') }
+    ]),
+    'attachments_index.csv': toCsv(attachments, [
+      { key: 'id' }, { key: 'original_filename', label: 'filename' }, { key: 'mime_type' }, { key: 'file_size' },
+      { key: 'sha256' }, { key: 'storage_kind' }, { key: 'linked_type' }, { key: 'linked_id' },
+      { key: 'uploader_email' }, { key: 'uploader_role' }, { key: 'created_at' }
+    ]),
+    'payslips.csv': toCsv(payslips, [
+      { key: 'id' }, { key: 'employee_id' }, { key: 'period_start' }, { key: 'period_end' },
+      { key: 'gross_pay' }, { key: 'net_pay' }, { key: 'created_at' }
+    ]),
+    'overtime_rules.csv': toCsv(overtimeRules, [
+      { key: 'employee_id' }, { key: 'normal_rate' }, { key: 'overtime_rate' }, { key: 'customer_rate' }, { key: 'vat_percent' }, { key: 'updated_at' }
+    ]),
+    'audit_log.csv': toCsv(auditRows, [
+      { key: 'sequence_number' }, { key: 'id' }, { key: 'created_at' }, { key: 'action' },
+      { key: 'actor_email' }, { key: 'actor_role' }, { key: 'target_type' }, { key: 'target_id' },
+      { key: 'prev_hash' }, { key: 'row_hash' }
+    ])
+  };
+
+  const saftPreparation = {
+    notice: 'SAF-T-forberedelse: strukturerede data til revisor/videre konvertering. Ikke officiel SAF-T XML.',
+    company: { system: 'Pengedag', backendVersion: VERSION },
+    sourceDocuments: {
+      timeEntries: timeRows,
+      attachmentsIndex: attachments.map(a => ({ id: a.id, filename: a.original_filename, sha256: a.sha256, linkedType: a.linked_type, linkedId: a.linked_id })),
+      payslips,
+      overtimeRules,
+      auditLog: auditRows.map(a => ({ sequence_number: a.sequence_number, id: a.id, action: a.action, target_type: a.target_type, target_id: a.target_id, actor_email: a.actor_email, actor_role: a.actor_role, created_at: a.created_at, prev_hash: a.prev_hash, row_hash: a.row_hash }))
+    },
+    controlTotals: summary
+  };
+
+  const manifest = {
+    app: 'Pengedag',
+    exportType: 'revisor_saft_preparation',
+    exportId,
+    backendVersion: VERSION,
+    exportedAt,
+    exportedBy: { id: reqUser.id, email: reqUser.email, role: reqUser.role },
+    counts: summary,
+    files: Object.keys(files).concat(['manifest.json', 'saft_preparation.json']),
+    legalNote: 'Dette er en revisor-eksport og SAF-T-forberedelse, ikke en officiel godkendelse eller officiel SAF-T XML-fil.'
+  };
+
+  const packageWithoutHashes = { manifest, files, saft_preparation: saftPreparation };
+  const packageHash = sha256(stableJson(packageWithoutHashes));
+  manifest.sha256 = packageHash;
+  files['manifest.json'] = JSON.stringify(manifest, null, 2);
+  files['saft_preparation.json'] = JSON.stringify(saftPreparation, null, 2);
+
+  return { manifest, files, saft_preparation: saftPreparation };
+}
+
+app.get('/api/admin/revisor/export', auth, requireRole('admin','owner','auditor'), async (req, res) => {
+  const pkg = await buildRevisorExport(req.user);
+  await audit(req.user, 'CREATE_REVISOR_EXPORT', 'revisor_export', pkg.manifest.exportId, { exportId: pkg.manifest.exportId, counts: pkg.manifest.counts, sha256: pkg.manifest.sha256 });
+  res.json({ ok: true, revisorExport: pkg });
+});
+
+app.get('/api/admin/saft/preview', auth, requireRole('admin','owner','auditor'), async (req, res) => {
+  const pkg = await buildRevisorExport(req.user);
+  await audit(req.user, 'CREATE_SAFT_PREVIEW', 'saft_preparation', pkg.manifest.exportId, { exportId: pkg.manifest.exportId, counts: pkg.manifest.counts, sha256: pkg.manifest.sha256 });
+  res.json({ ok: true, notice: 'SAF-T-forberedelse - ikke officiel SAF-T XML', manifest: pkg.manifest, saft_preparation: pkg.saft_preparation });
+});
 
 
 // v1.6.12: Backup / eksport / kontrolleret gendannelse

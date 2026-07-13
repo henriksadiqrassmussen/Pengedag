@@ -1,7 +1,7 @@
 {
   "name": "pengedag-backend-login-adgang",
-  "version": "1.6.12",
-  "description": "Pengedag Backend PostgreSQL Login Immutable AuditLog Bilagsopbevaring Audit Log Fix",
+  "version": "1.6.13",
+  "description": "Pengedag Backend PostgreSQL Revisor Eksport SAF-T Forberedelse",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
