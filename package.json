@@ -1,7 +1,7 @@
 {
   "name": "pengedag-backend-login-adgang",
-  "version": "1.6.6",
-  "description": "Pengedag Backend PostgreSQL Login Access MigrationSafe",
+  "version": "1.6.7",
+  "description": "Pengedag Backend PostgreSQL Login Immutable AuditLog Bilagsopbevaring",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"

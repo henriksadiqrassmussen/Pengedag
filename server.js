@@ -9,9 +9,9 @@ const crypto = require('crypto');
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '2mb' }));
+app.use(express.json({ limit: '15mb' }));
 
-const VERSION = '1.6.6-audit-hash-repair';
+const VERSION = '1.6.7-bilag-opbevaring';
 const PORT = process.env.PORT || 8080;
 const JWT_SECRET = process.env.JWT_SECRET || 'DEV_ONLY_CHANGE_ME_PENGEDAG';
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -232,6 +232,25 @@ async function initDb() {
     )
   `);
 
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS attachments (
+      id TEXT PRIMARY KEY,
+      uploader_user_id TEXT DEFAULT '',
+      uploader_email TEXT DEFAULT '',
+      uploader_role TEXT DEFAULT '',
+      original_filename TEXT DEFAULT '',
+      mime_type TEXT DEFAULT '',
+      file_size INTEGER DEFAULT 0,
+      sha256 TEXT DEFAULT '',
+      storage_kind TEXT DEFAULT 'postgres_bytea',
+      linked_type TEXT DEFAULT '',
+      linked_id TEXT DEFAULT '',
+      file_data BYTEA NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
   // 2) Migrations til gamle v1.6.0/v1.6.1 tabeller. Disse koerer foer indexes.
   await addColumnIfMissing('time_entries', 'user_id', "TEXT DEFAULT ''");
   await addColumnIfMissing('time_entries', 'employee_id', "TEXT DEFAULT ''");
@@ -267,6 +286,18 @@ async function initDb() {
   await addColumnIfMissing('users', 'name', "TEXT DEFAULT ''");
   await addColumnIfMissing('users', 'active', 'BOOLEAN NOT NULL DEFAULT TRUE');
 
+  await addColumnIfMissing('attachments', 'uploader_user_id', "TEXT DEFAULT ''");
+  await addColumnIfMissing('attachments', 'uploader_email', "TEXT DEFAULT ''");
+  await addColumnIfMissing('attachments', 'uploader_role', "TEXT DEFAULT ''");
+  await addColumnIfMissing('attachments', 'original_filename', "TEXT DEFAULT ''");
+  await addColumnIfMissing('attachments', 'mime_type', "TEXT DEFAULT ''");
+  await addColumnIfMissing('attachments', 'file_size', 'INTEGER DEFAULT 0');
+  await addColumnIfMissing('attachments', 'sha256', "TEXT DEFAULT ''");
+  await addColumnIfMissing('attachments', 'storage_kind', "TEXT DEFAULT 'postgres_bytea'");
+  await addColumnIfMissing('attachments', 'linked_type', "TEXT DEFAULT ''");
+  await addColumnIfMissing('attachments', 'linked_id', "TEXT DEFAULT ''");
+  await addColumnIfMissing('attachments', 'created_at', 'TIMESTAMPTZ NOT NULL DEFAULT NOW()');
+
 
   // 3) Goer audit log uforanderlig og hash-kaedet.
   // Gamle audit-rows faar hash/sequence foer triggeren laaser UPDATE/DELETE.
@@ -282,6 +313,9 @@ async function initDb() {
   await safeCreateIndex('idx_audit_log_target_id', 'audit_log', 'target_id');
   await safeCreateIndex('idx_audit_log_sequence_number', 'audit_log', 'sequence_number');
   await safeCreateIndex('idx_audit_log_row_hash', 'audit_log', 'row_hash');
+  await safeCreateIndex('idx_attachments_uploader_user_id', 'attachments', 'uploader_user_id');
+  await safeCreateIndex('idx_attachments_linked_id', 'attachments', 'linked_id');
+  await safeCreateIndex('idx_attachments_sha256', 'attachments', 'sha256');
 
   console.log('Database migrations OK - Pengedag ' + VERSION);
 }
@@ -396,7 +430,7 @@ app.get('/health', async (req, res) => {
 
 app.get('/api/mobile/routes', (req, res) => res.json({ ok: true, version: VERSION, routes: [
   'GET /health', 'POST /api/auth/bootstrap-admin', 'POST /api/auth/login', 'GET /api/auth/me', 'POST /api/auth/users',
-  'POST /api/mobile/time-entry', 'GET /api/mobile/times', 'POST /api/mobile/time-entries/:id/approve', 'POST /api/mobile/time-entries/:id/reject', 'GET /api/admin/audit-log', 'GET /api/admin/audit-log/verify'
+  'POST /api/mobile/time-entry', 'GET /api/mobile/times', 'POST /api/mobile/time-entries/:id/approve', 'POST /api/mobile/time-entries/:id/reject', 'POST /api/bilag/upload', 'GET /api/bilag', 'GET /api/bilag/:id', 'GET /api/bilag/:id/download', 'GET /api/admin/audit-log', 'GET /api/admin/audit-log/verify'
 ]}));
 
 app.post('/api/auth/bootstrap-admin', async (req, res) => {
@@ -520,6 +554,113 @@ app.get('/api/admin/audit-log/verify', auth, requireRole('admin','auditor'), asy
     problems,
     message: problems.length === 0 ? 'Audit log hash-kaede er OK' : 'Audit log har afvigelser'
   });
+});
+
+
+const ALLOWED_ATTACHMENT_TYPES = new Set(['time_entry', 'invoice', 'payslip', 'employee', 'customer', 'other']);
+const ALLOWED_MIME_TYPES = new Set(['application/pdf', 'image/jpeg', 'image/png', 'image/webp', 'text/plain']);
+const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
+
+function extractBase64File(input) {
+  let raw = String(input || '');
+  const match = raw.match(/^data:([^;]+);base64,(.*)$/);
+  if (match) return { mimeFromDataUrl: match[1], base64: match[2] };
+  return { mimeFromDataUrl: '', base64: raw };
+}
+
+async function canAccessAttachment(user, attachment) {
+  if (!user || !attachment) return false;
+  if (['admin', 'owner', 'auditor'].includes(user.role)) return true;
+  if (attachment.uploader_user_id === user.id) return true;
+  if (user.role === 'employee' && attachment.linked_type === 'time_entry' && attachment.linked_id) {
+    const r = await query('SELECT id FROM time_entries WHERE id=$1 AND (user_id=$2 OR employee_id=$3) LIMIT 1', [attachment.linked_id, user.id, user.employee_id || '']);
+    return r.rows.length > 0;
+  }
+  return false;
+}
+
+app.post('/api/bilag/upload', auth, async (req, res) => {
+  const body = req.body || {};
+  const filename = String(body.filename || body.originalFilename || 'bilag').replace(/[\\/]/g, '_').slice(0, 180);
+  const linkedType = String(body.linkedType || body.linked_type || body.type || 'other');
+  const linkedId = String(body.linkedId || body.linked_id || body.entityId || '');
+  const { mimeFromDataUrl, base64 } = extractBase64File(body.fileBase64 || body.base64 || body.data || '');
+  const mimeType = String(body.mimeType || body.mime_type || mimeFromDataUrl || 'application/octet-stream');
+
+  if (!base64) return res.status(400).json({ ok: false, error: 'fileBase64 mangler' });
+  if (!ALLOWED_ATTACHMENT_TYPES.has(linkedType)) return res.status(400).json({ ok: false, error: 'Ugyldig linkedType', allowed: Array.from(ALLOWED_ATTACHMENT_TYPES) });
+  if (!ALLOWED_MIME_TYPES.has(mimeType)) return res.status(400).json({ ok: false, error: 'Filtype er ikke tilladt', mimeType, allowed: Array.from(ALLOWED_MIME_TYPES) });
+
+  let buffer;
+  try {
+    buffer = Buffer.from(base64, 'base64');
+  } catch (e) {
+    return res.status(400).json({ ok: false, error: 'Ugyldig base64-fil' });
+  }
+  if (!buffer.length) return res.status(400).json({ ok: false, error: 'Tom fil' });
+  if (buffer.length > MAX_ATTACHMENT_BYTES) return res.status(413).json({ ok: false, error: 'Bilag er for stort', maxBytes: MAX_ATTACHMENT_BYTES });
+
+  // Medarbejder maa kun knytte bilag til egne timer.
+  if (req.user.role === 'employee' && linkedType === 'time_entry' && linkedId) {
+    const r = await query('SELECT id FROM time_entries WHERE id=$1 AND (user_id=$2 OR employee_id=$3) LIMIT 1', [linkedId, req.user.id, req.user.employee_id || '']);
+    if (!r.rows.length) return res.status(403).json({ ok: false, error: 'Medarbejder kan kun uploade bilag til egne timer' });
+  }
+
+  const id = makeId('bilag');
+  const hash = sha256(buffer);
+  await query(`INSERT INTO attachments
+    (id,uploader_user_id,uploader_email,uploader_role,original_filename,mime_type,file_size,sha256,storage_kind,linked_type,linked_id,file_data)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+    [id, req.user.id, req.user.email, req.user.role, filename, mimeType, buffer.length, hash, 'postgres_bytea', linkedType, linkedId, buffer]
+  );
+  await audit(req.user, 'upload_attachment', 'attachment', id, { filename, mimeType, fileSize: buffer.length, sha256: hash, linkedType, linkedId });
+  res.json({ ok: true, attachment: { id, filename, mimeType, fileSize: buffer.length, sha256: hash, linkedType, linkedId, storageKind: 'postgres_bytea' } });
+});
+
+app.get('/api/bilag', auth, async (req, res) => {
+  const linkedType = String(req.query.linkedType || req.query.linked_type || '');
+  const linkedId = String(req.query.linkedId || req.query.linked_id || '');
+  const params = [];
+  let where = 'WHERE 1=1';
+  if (linkedType) { params.push(linkedType); where += ` AND linked_type=$${params.length}`; }
+  if (linkedId) { params.push(linkedId); where += ` AND linked_id=$${params.length}`; }
+
+  if (req.user.role === 'employee') {
+    params.push(req.user.id); const pUser = params.length;
+    params.push(req.user.employee_id || ''); const pEmp = params.length;
+    where += ` AND (uploader_user_id=$${pUser} OR (linked_type='time_entry' AND linked_id IN (SELECT id FROM time_entries WHERE user_id=$${pUser} OR employee_id=$${pEmp})))`;
+  }
+
+  const r = await query(`SELECT id,uploader_user_id,uploader_email,uploader_role,original_filename,mime_type,file_size,sha256,storage_kind,linked_type,linked_id,created_at FROM attachments ${where} ORDER BY created_at DESC LIMIT 300`, params);
+  res.json({ ok: true, count: r.rows.length, attachments: r.rows.map(x => ({
+    id: x.id, uploaderUserId: x.uploader_user_id, uploaderEmail: x.uploader_email, uploaderRole: x.uploader_role,
+    filename: x.original_filename, mimeType: x.mime_type, fileSize: x.file_size, sha256: x.sha256,
+    storageKind: x.storage_kind, linkedType: x.linked_type, linkedId: x.linked_id, createdAt: x.created_at
+  })) });
+});
+
+app.get('/api/bilag/:id', auth, async (req, res) => {
+  const r = await query('SELECT id,uploader_user_id,uploader_email,uploader_role,original_filename,mime_type,file_size,sha256,storage_kind,linked_type,linked_id,created_at FROM attachments WHERE id=$1', [req.params.id]);
+  if (!r.rows.length) return res.status(404).json({ ok: false, error: 'Bilag ikke fundet' });
+  if (!(await canAccessAttachment(req.user, r.rows[0]))) return res.status(403).json({ ok: false, error: 'Ingen adgang til bilag' });
+  const x = r.rows[0];
+  res.json({ ok: true, attachment: {
+    id: x.id, uploaderUserId: x.uploader_user_id, uploaderEmail: x.uploader_email, uploaderRole: x.uploader_role,
+    filename: x.original_filename, mimeType: x.mime_type, fileSize: x.file_size, sha256: x.sha256,
+    storageKind: x.storage_kind, linkedType: x.linked_type, linkedId: x.linked_id, createdAt: x.created_at
+  }});
+});
+
+app.get('/api/bilag/:id/download', auth, async (req, res) => {
+  const r = await query('SELECT * FROM attachments WHERE id=$1', [req.params.id]);
+  if (!r.rows.length) return res.status(404).json({ ok: false, error: 'Bilag ikke fundet' });
+  const x = r.rows[0];
+  if (!(await canAccessAttachment(req.user, x))) return res.status(403).json({ ok: false, error: 'Ingen adgang til bilag' });
+  await audit(req.user, 'download_attachment', 'attachment', x.id, { filename: x.original_filename, linkedType: x.linked_type, linkedId: x.linked_id });
+  res.setHeader('Content-Type', x.mime_type || 'application/octet-stream');
+  res.setHeader('Content-Length', x.file_size || x.file_data.length);
+  res.setHeader('Content-Disposition', `attachment; filename="${String(x.original_filename || 'bilag').replace(/"/g, '')}"`);
+  res.send(x.file_data);
 });
 
 app.get('/api/mobile/overtime-rules/:employeeId', auth, async (req, res) => {
