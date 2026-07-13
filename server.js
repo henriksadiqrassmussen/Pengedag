@@ -8,10 +8,69 @@ const { Pool } = require('pg');
 const crypto = require('crypto');
 
 const app = express();
-app.use(cors());
-app.use(express.json({ limit: '15mb' }));
+app.disable('x-powered-by');
+app.set('trust proxy', 1);
 
-const VERSION = '1.6.14-gdpr-dpa-dokumentation';
+const JSON_LIMIT = process.env.JSON_LIMIT || '10mb';
+const RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS || 15 * 60 * 1000);
+const RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_MAX || 300);
+const LOGIN_RATE_LIMIT_MAX = Number(process.env.LOGIN_RATE_LIMIT_MAX || 10);
+const SECURITY_CONTACT_EMAIL = process.env.SECURITY_CONTACT_EMAIL || 'vault1973@gmail.com';
+
+function securityHeaders(req, res, next) {
+  const requestId = crypto.randomBytes(8).toString('hex');
+  req.requestId = requestId;
+  res.setHeader('X-Request-Id', requestId);
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=()');
+  res.setHeader('Cross-Origin-Resource-Policy', 'same-site');
+  if (process.env.NODE_ENV === 'production') {
+    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  }
+  next();
+}
+
+const rateBuckets = new Map();
+function clientIp(req) {
+  return (req.headers['x-forwarded-for'] || req.ip || req.socket?.remoteAddress || 'unknown').toString().split(',')[0].trim();
+}
+function makeRateLimiter(name, max, windowMs) {
+  return (req, res, next) => {
+    const now = Date.now();
+    const key = `${name}:${clientIp(req)}`;
+    let bucket = rateBuckets.get(key);
+    if (!bucket || now > bucket.resetAt) {
+      bucket = { count: 0, resetAt: now + windowMs };
+    }
+    bucket.count += 1;
+    rateBuckets.set(key, bucket);
+    res.setHeader('X-RateLimit-Limit', String(max));
+    res.setHeader('X-RateLimit-Remaining', String(Math.max(0, max - bucket.count)));
+    res.setHeader('X-RateLimit-Reset', String(Math.ceil(bucket.resetAt / 1000)));
+    if (bucket.count > max) {
+      return res.status(429).json({ ok: false, error: 'For mange forespoergsler. Proev igen senere.', requestId: req.requestId });
+    }
+    next();
+  };
+}
+function isStrongSecret(value) {
+  return typeof value === 'string' && value.length >= 32 && !value.includes('DEV_ONLY') && !value.includes('CHANGE_ME');
+}
+
+app.use(securityHeaders);
+app.use(makeRateLimiter('global', RATE_LIMIT_MAX, RATE_LIMIT_WINDOW_MS));
+app.use(cors({
+  origin: (origin, cb) => {
+    const allowed = (process.env.CORS_ORIGINS || '').split(',').map(x => x.trim()).filter(Boolean);
+    if (!origin || allowed.length === 0 || allowed.includes(origin)) return cb(null, true);
+    return cb(new Error('CORS origin ikke tilladt'));
+  }
+}));
+app.use(express.json({ limit: JSON_LIMIT }));
+
+const VERSION = '1.6.15-produktionsklar-sikkerhed';
 const PORT = process.env.PORT || 8080;
 const JWT_SECRET = process.env.JWT_SECRET || 'DEV_ONLY_CHANGE_ME_PENGEDAG';
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -508,8 +567,37 @@ app.get('/health', async (req, res) => {
 
 app.get('/api/mobile/routes', (req, res) => res.json({ ok: true, version: VERSION, routes: [
   'GET /health', 'POST /api/auth/bootstrap-admin', 'POST /api/auth/login', 'GET /api/auth/me', 'POST /api/auth/users',
-  'POST /api/mobile/time-entry', 'GET /api/mobile/times', 'POST /api/mobile/time-entries/:id/approve', 'POST /api/mobile/time-entries/:id/reject', 'POST /api/bilag/upload', 'GET /api/bilag', 'GET /api/bilag/:id', 'GET /api/bilag/:id/download', 'GET /api/admin/backup/export', 'POST /api/admin/backup/restore', 'GET /api/admin/revisor/export', 'GET /api/admin/saft/preview', 'GET /api/legal/gdpr', 'GET /api/legal/dpa', 'GET /api/gdpr/my-data', 'GET /api/admin/gdpr/export-user/:userId', 'POST /api/admin/gdpr/record-request', 'GET /api/admin/audit-log', 'GET /api/admin/audit-log/verify'
+  'POST /api/mobile/time-entry', 'GET /api/mobile/times', 'POST /api/mobile/time-entries/:id/approve', 'POST /api/mobile/time-entries/:id/reject', 'POST /api/bilag/upload', 'GET /api/bilag', 'GET /api/bilag/:id', 'GET /api/bilag/:id/download', 'GET /api/admin/backup/export', 'POST /api/admin/backup/restore', 'GET /api/admin/revisor/export', 'GET /api/admin/saft/preview', 'GET /api/legal/gdpr', 'GET /api/legal/dpa', 'GET /api/gdpr/my-data', 'GET /api/admin/gdpr/export-user/:userId', 'POST /api/admin/gdpr/record-request', 'GET /api/admin/audit-log', 'GET /api/admin/audit-log/verify', 'GET /api/admin/security/status', 'POST /api/admin/security/record-check'
 ]}));
+
+app.get('/api/admin/security/status', auth, requireRole('admin','auditor'), async (req, res) => {
+  const checks = {
+    nodeEnvProduction: process.env.NODE_ENV === 'production',
+    jwtSecretStrong: isStrongSecret(process.env.JWT_SECRET || ''),
+    databaseUrlPresent: !!DATABASE_URL,
+    jsonLimit: JSON_LIMIT,
+    globalRateLimit: { windowMs: RATE_LIMIT_WINDOW_MS, max: RATE_LIMIT_MAX },
+    loginRateLimit: { windowMs: RATE_LIMIT_WINDOW_MS, max: LOGIN_RATE_LIMIT_MAX },
+    securityHeaders: ['X-Content-Type-Options','X-Frame-Options','Referrer-Policy','Permissions-Policy','Strict-Transport-Security'],
+    corsLockedToOrigins: !!(process.env.CORS_ORIGINS || '').trim(),
+    securityContactEmail: SECURITY_CONTACT_EMAIL
+  };
+  const warnings = [];
+  if (!checks.nodeEnvProduction) warnings.push('NODE_ENV er ikke production');
+  if (!checks.jwtSecretStrong) warnings.push('JWT_SECRET boer vaere mindst 32 tegn og ikke standardtekst');
+  if (!checks.corsLockedToOrigins) warnings.push('CORS_ORIGINS er ikke sat; API tillader derfor browserkald fra alle origins');
+  res.json({ ok: true, version: VERSION, checks, warnings });
+});
+
+app.post('/api/admin/security/record-check', auth, requireRole('admin','auditor'), async (req, res) => {
+  await audit(req.user, 'SECURITY_CHECK', 'security', req.requestId || 'manual', {
+    note: req.body?.note || 'Manuel sikkerhedskontrol',
+    ip: clientIp(req),
+    userAgent: req.headers['user-agent'] || '',
+    version: VERSION
+  });
+  res.json({ ok: true, message: 'Sikkerhedskontrol skrevet i audit log', requestId: req.requestId });
+});
 
 app.post('/api/auth/bootstrap-admin', async (req, res) => {
   const existing = await query("SELECT COUNT(*)::int AS count FROM users WHERE role='admin'");
@@ -523,7 +611,7 @@ app.post('/api/auth/bootstrap-admin', async (req, res) => {
   res.json({ ok: true, user: { id, email: email.toLowerCase(), role: 'admin', name: name || 'Admin' }, token: signToken({ id, email: email.toLowerCase(), role: 'admin', employee_id: '' }) });
 });
 
-app.post('/api/auth/login', async (req, res) => {
+app.post('/api/auth/login', makeRateLimiter('login', LOGIN_RATE_LIMIT_MAX, RATE_LIMIT_WINDOW_MS), async (req, res) => {
   const { email, password } = req.body || {};
   const r = await query('SELECT * FROM users WHERE email=$1', [String(email || '').toLowerCase()]);
   if (!r.rows.length) return res.status(401).json({ ok: false, error: 'Forkert login' });
@@ -1263,6 +1351,21 @@ app.post('/api/mobile/payslip', auth, requireRole('admin','owner'), async (req, 
 app.get('/api/mobile/payslip/:employeeId', auth, async (req, res) => {
   const r = await query('SELECT * FROM payslips WHERE employee_id=$1 ORDER BY created_at DESC LIMIT 20', [req.params.employeeId]);
   res.json({ ok:true, count:r.rows.length, payslips:r.rows });
+});
+
+app.use((err, req, res, next) => {
+  if (err && err.type === 'entity.too.large') {
+    return res.status(413).json({ ok: false, error: 'Request er for stor', limit: JSON_LIMIT, requestId: req.requestId });
+  }
+  if (err && String(err.message || '').includes('CORS')) {
+    return res.status(403).json({ ok: false, error: 'CORS origin ikke tilladt', requestId: req.requestId });
+  }
+  console.error('Uventet serverfejl', req.requestId, err);
+  res.status(500).json({ ok: false, error: 'Serverfejl', requestId: req.requestId });
+});
+
+app.use((req, res) => {
+  res.status(404).json({ ok: false, error: 'Not found', path: req.path, requestId: req.requestId });
 });
 
 initDb()
