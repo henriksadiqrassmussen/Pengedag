@@ -11,7 +11,7 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '15mb' }));
 
-const VERSION = '1.6.10-audit-legacy-columns-fix';
+const VERSION = '1.6.11-audit-id-hash-fix';
 const PORT = process.env.PORT || 8080;
 const JWT_SECRET = process.env.JWT_SECRET || 'DEV_ONLY_CHANGE_ME_PENGEDAG';
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -379,10 +379,28 @@ async function audit(actor, action, targetType, targetId, details = {}) {
   const idType = idTypeResult.rows[0]?.data_type || 'text';
   const columnDefault = idTypeResult.rows[0]?.column_default || '';
   const numericId = ['integer', 'bigint', 'smallint', 'numeric'].includes(idType);
+
+  // v1.6.11: Hvis audit_log.id er SERIAL/BIGSERIAL, skal vi kende id'et FOER hash beregnes.
+  // Ellers bliver row_hash lavet med id=null, mens verify senere bruger det rigtige id (fx 4),
+  // og saa faar vi row_hash_mismatch. Derfor reserverer vi naeste sequence-id selv.
+  let preallocatedAuditId = null;
+  if (numericId) {
+    try {
+      const seq = await query(`SELECT pg_get_serial_sequence('audit_log','id') AS seq`);
+      const seqName = seq.rows[0]?.seq;
+      if (seqName) {
+        const next = await query(`SELECT nextval($1::regclass) AS id`, [seqName]);
+        preallocatedAuditId = next.rows[0]?.id;
+      }
+    } catch (e) {
+      console.warn('Kunne ikke forud-reservere audit_log.id:', e.message);
+    }
+  }
+
   const createdAt = new Date();
 
   const row = {
-    id: numericId ? null : makeId('audit'),
+    id: numericId ? preallocatedAuditId : makeId('audit'),
     actor_user_id: actor?.id || '',
     actor_email: actor?.email || '',
     actor_role: actor?.role || '',
@@ -396,7 +414,7 @@ async function audit(actor, action, targetType, targetId, details = {}) {
   };
   row.row_hash = buildAuditHash(row);
 
-  // v1.6.10: Robust INSERT til baade nye og gamle audit_log-skemaer.
+  // v1.6.11: Robust INSERT til baade nye og gamle audit_log-skemaer.
   // Nogle gamle databaser har NOT NULL kolonnerne entity_type/entity_id/payload.
   // Derfor bygger vi INSERT dynamisk ud fra de kolonner, databasen faktisk har.
   const colsResult = await query(`
@@ -424,8 +442,12 @@ async function audit(actor, action, targetType, targetId, details = {}) {
     created_at: createdAt
   };
 
-  if (!numericId && !columnDefault.includes('nextval') && existingCols.has('id')) {
-    data.id = row.id;
+  if (existingCols.has('id')) {
+    if (numericId && preallocatedAuditId !== null && preallocatedAuditId !== undefined) {
+      data.id = preallocatedAuditId;
+    } else if (!numericId && !columnDefault.includes('nextval')) {
+      data.id = row.id;
+    }
   }
 
   const preferredOrder = [
