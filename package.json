@@ -1,7 +1,7 @@
 {
   "name": "pengedag-backend-login-adgang",
-  "version": "1.6.13",
-  "description": "Pengedag Backend PostgreSQL Revisor Eksport SAF-T Forberedelse",
+  "version": "1.6.14",
+  "description": "Pengedag Backend PostgreSQL GDPR DPA Dokumentation",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"

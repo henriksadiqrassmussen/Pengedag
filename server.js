@@ -11,7 +11,7 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '15mb' }));
 
-const VERSION = '1.6.13-revisor-saft-forberedelse';
+const VERSION = '1.6.14-gdpr-dpa-dokumentation';
 const PORT = process.env.PORT || 8080;
 const JWT_SECRET = process.env.JWT_SECRET || 'DEV_ONLY_CHANGE_ME_PENGEDAG';
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -508,7 +508,7 @@ app.get('/health', async (req, res) => {
 
 app.get('/api/mobile/routes', (req, res) => res.json({ ok: true, version: VERSION, routes: [
   'GET /health', 'POST /api/auth/bootstrap-admin', 'POST /api/auth/login', 'GET /api/auth/me', 'POST /api/auth/users',
-  'POST /api/mobile/time-entry', 'GET /api/mobile/times', 'POST /api/mobile/time-entries/:id/approve', 'POST /api/mobile/time-entries/:id/reject', 'POST /api/bilag/upload', 'GET /api/bilag', 'GET /api/bilag/:id', 'GET /api/bilag/:id/download', 'GET /api/admin/backup/export', 'POST /api/admin/backup/restore', 'GET /api/admin/revisor/export', 'GET /api/admin/saft/preview', 'GET /api/admin/audit-log', 'GET /api/admin/audit-log/verify'
+  'POST /api/mobile/time-entry', 'GET /api/mobile/times', 'POST /api/mobile/time-entries/:id/approve', 'POST /api/mobile/time-entries/:id/reject', 'POST /api/bilag/upload', 'GET /api/bilag', 'GET /api/bilag/:id', 'GET /api/bilag/:id/download', 'GET /api/admin/backup/export', 'POST /api/admin/backup/restore', 'GET /api/admin/revisor/export', 'GET /api/admin/saft/preview', 'GET /api/legal/gdpr', 'GET /api/legal/dpa', 'GET /api/gdpr/my-data', 'GET /api/admin/gdpr/export-user/:userId', 'POST /api/admin/gdpr/record-request', 'GET /api/admin/audit-log', 'GET /api/admin/audit-log/verify'
 ]}));
 
 app.post('/api/auth/bootstrap-admin', async (req, res) => {
@@ -917,6 +917,178 @@ app.get('/api/admin/saft/preview', auth, requireRole('admin','owner','auditor'),
   const pkg = await buildRevisorExport(req.user);
   await audit(req.user, 'CREATE_SAFT_PREVIEW', 'saft_preparation', pkg.manifest.exportId, { exportId: pkg.manifest.exportId, counts: pkg.manifest.counts, sha256: pkg.manifest.sha256 });
   res.json({ ok: true, notice: 'SAF-T-forberedelse - ikke officiel SAF-T XML', manifest: pkg.manifest, saft_preparation: pkg.saft_preparation });
+});
+
+
+// v1.6.14: GDPR / DPA / dokumentation
+// Formaal: give klar dokumentation, datakort, brugerdata-eksport og audit-log for GDPR-handlinger.
+// Bemærk: Dette er teknisk GDPR-understøttelse og dokumentationskladder - ikke juridisk rådgivning.
+function gdprDocument() {
+  return {
+    title: 'Pengedag GDPR-dokumentation',
+    version: VERSION,
+    status: 'Kladde til drift og revisor/partnergennemgang',
+    generatedAt: new Date().toISOString(),
+    controller: {
+      name: 'Pengedag-kunden / virksomheden der bruger systemet',
+      role: 'Dataansvarlig'
+    },
+    processor: {
+      name: 'Pengedag',
+      role: 'Databehandler / teknisk systemleverandoer'
+    },
+    purpose: [
+      'Registrering af arbejdstid og godkendelse',
+      'Forberedelse af loensedler og fakturagrundlag',
+      'Bilagsopbevaring og dokumentation',
+      'Revisor-eksport og teknisk kontrolspor',
+      'Sikker drift, fejlfinding og adgangsstyring'
+    ],
+    dataCategories: [
+      { category: 'Brugere', examples: ['navn', 'email', 'rolle', 'medarbejder-id', 'aktiv-status'] },
+      { category: 'Timer', examples: ['dato', 'start/slut', 'pause', 'timer', 'status', 'note'] },
+      { category: 'Bilag', examples: ['filnavn', 'mime-type', 'filstoerrelse', 'SHA-256 hash', 'filindhold i PostgreSQL BYTEA', 'tilknytning'] },
+      { category: 'Loensedler', examples: ['periode', 'medarbejder', 'loenseddeldata_json'] },
+      { category: 'Audit log', examples: ['handling', 'rolle', 'email', 'target', 'hash-kaede', 'tidspunkt'] }
+    ],
+    securityMeasures: [
+      'Login med JWT-token',
+      'Rollebaseret adgang: admin, owner, employee, auditor',
+      'PostgreSQL database',
+      'Bilag med SHA-256 fil-hash',
+      'Immutable audit-log med hash-kaede',
+      'Backup/export og revisor-export skrives i audit log',
+      'Restore overskriver ikke eksisterende id’er og sletter ikke live data'
+    ],
+    retentionDraft: {
+      timeEntries: 'Efter kundens lovpligtige opbevaringskrav og interne politik',
+      attachments: 'Efter kundens lovpligtige opbevaringskrav og interne politik',
+      auditLog: 'Boer opbevares som kontrolspor og ikke slettes uden dokumenteret hjemmel',
+      inactiveUsers: 'Boer kunne deaktiveres og evt. anonymiseres efter politik'
+    },
+    dataSubjectRightsSupported: [
+      'Eksport af egne brugerdata via /api/gdpr/my-data',
+      'Admin/revisor eksport af brugerdata via /api/admin/gdpr/export-user/:userId',
+      'Registrering af GDPR-anmodning via /api/admin/gdpr/record-request',
+      'Alle GDPR-handlinger skrives i immutable audit log'
+    ],
+    disclaimer: 'Dette er teknisk dokumentation og en driftskladde. Endelig GDPR-tekst/DPA boer gennemgaas af ansvarlig virksomhed og evt. juridisk raadgiver.'
+  };
+}
+
+function dpaDocument() {
+  return {
+    title: 'Pengedag Databehandleraftale - DPA kladde',
+    version: VERSION,
+    generatedAt: new Date().toISOString(),
+    parties: {
+      controller: 'Kunden / virksomheden der bruger Pengedag',
+      processor: 'Pengedag / systemleverandoer'
+    },
+    clauses: [
+      { section: 'Formaal', text: 'Databehandleren behandler personoplysninger for at levere timer, bilag, loensedler, revisor-eksport, backup og adgangsstyring.' },
+      { section: 'Instruks', text: 'Databehandleren maa kun behandle data efter kundens dokumenterede instruks og til drift af Pengedag.' },
+      { section: 'Fortrolighed', text: 'Adgang til data skal begraenses til relevante roller og driftsbehov.' },
+      { section: 'Sikkerhed', text: 'Systemet bruger rollebaseret adgang, audit-log, hash-kontrol, PostgreSQL og login-token.' },
+      { section: 'Underleverandoerer', text: 'Hosting/database og eventuelle tredjepartsleverandoerer skal listes og godkendes efter kundens aftale.' },
+      { section: 'Bistand', text: 'Systemet understoetter dataeksport, revisor-eksport og registrering af GDPR-anmodninger.' },
+      { section: 'Sletning/returnering', text: 'Ved aftalens ophoer skal data kunne eksporteres og derefter slettes/anonymiseres efter kundens instruks.' },
+      { section: 'Dokumentation', text: 'Audit-log og eksportfunktioner kan bruges som teknisk dokumentation for handlinger.' }
+    ],
+    disclaimer: 'DPA-kladden er ikke juridisk rådgivning og skal tilpasses den konkrete virksomhed og underleverandoerer.'
+  };
+}
+
+function redactUser(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    email: row.email,
+    role: row.role,
+    employee_id: row.employee_id || '',
+    name: row.name || '',
+    active: !!row.active,
+    created_at: row.created_at,
+    updated_at: row.updated_at
+  };
+}
+
+async function buildUserDataExport(userId) {
+  const userR = await query('SELECT id,email,role,employee_id,name,active,created_at,updated_at FROM users WHERE id=$1', [userId]);
+  if (!userR.rows.length) return null;
+  const u = userR.rows[0];
+  const employeeId = u.employee_id || '';
+
+  const timeEntries = employeeId
+    ? await query('SELECT * FROM time_entries WHERE employee_id=$1 ORDER BY created_at ASC, id ASC', [employeeId])
+    : { rows: [] };
+
+  const attachments = await query(`
+    SELECT id,uploader_user_id,uploader_email,uploader_role,original_filename,mime_type,file_size,sha256,storage_kind,linked_type,linked_id,created_at
+    FROM attachments
+    WHERE uploader_user_id=$1 OR uploader_email=$2 OR linked_id IN (SELECT id FROM time_entries WHERE employee_id=$3)
+    ORDER BY created_at ASC, id ASC
+  `, [u.id, u.email, employeeId]);
+
+  const payslips = employeeId
+    ? await query('SELECT * FROM payslips WHERE employee_id=$1 ORDER BY created_at ASC, id ASC', [employeeId])
+    : { rows: [] };
+
+  const auditRows = await query(`
+    SELECT * FROM audit_log
+    WHERE actor_user_id=$1 OR actor_email=$2 OR target_id=$1 OR target_id IN (SELECT id FROM time_entries WHERE employee_id=$3)
+    ORDER BY sequence_number ASC, created_at ASC, id ASC
+  `, [u.id, u.email, employeeId]);
+
+  const exportData = {
+    exportType: 'gdpr_user_data_export',
+    generatedAt: new Date().toISOString(),
+    subject: redactUser(u),
+    data: {
+      user: redactUser(u),
+      time_entries: timeEntries.rows,
+      attachments_index: attachments.rows,
+      payslips: payslips.rows,
+      audit_log_related: auditRows.rows
+    },
+    note: 'Bilagsfilindhold er ikke inkluderet her; bilag kan downloades via bilag-download med adgangskontrol.'
+  };
+  exportData.sha256 = sha256(stableJson(exportData));
+  return exportData;
+}
+
+app.get('/api/legal/gdpr', (req, res) => {
+  res.json({ ok: true, gdpr: gdprDocument() });
+});
+
+app.get('/api/legal/dpa', (req, res) => {
+  res.json({ ok: true, dpa: dpaDocument() });
+});
+
+app.get('/api/gdpr/my-data', auth, async (req, res) => {
+  const data = await buildUserDataExport(req.user.id);
+  if (!data) return res.status(404).json({ ok: false, error: 'Bruger ikke fundet' });
+  await audit(req.user, 'GDPR_EXPORT_MY_DATA', 'user', req.user.id, { sha256: data.sha256, email: req.user.email });
+  res.json({ ok: true, export: data });
+});
+
+app.get('/api/admin/gdpr/export-user/:userId', auth, requireRole('admin','owner','auditor'), async (req, res) => {
+  const data = await buildUserDataExport(req.params.userId);
+  if (!data) return res.status(404).json({ ok: false, error: 'Bruger ikke fundet' });
+  await audit(req.user, 'GDPR_EXPORT_USER_DATA', 'user', req.params.userId, { sha256: data.sha256, subjectEmail: data.subject.email });
+  res.json({ ok: true, export: data });
+});
+
+app.post('/api/admin/gdpr/record-request', auth, requireRole('admin','owner'), async (req, res) => {
+  const requestType = String(req.body?.requestType || '').trim() || 'unspecified';
+  const subjectUserId = String(req.body?.subjectUserId || '').trim();
+  const subjectEmail = String(req.body?.subjectEmail || '').trim();
+  const status = String(req.body?.status || 'received').trim();
+  const note = String(req.body?.note || '').trim();
+  const requestId = makeId('gdpr_req');
+  const record = { requestId, requestType, subjectUserId, subjectEmail, status, note, recordedAt: new Date().toISOString() };
+  await audit(req.user, 'GDPR_RECORD_REQUEST', 'gdpr_request', requestId, record);
+  res.json({ ok: true, request: record });
 });
 
 
