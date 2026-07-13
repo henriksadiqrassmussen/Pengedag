@@ -11,7 +11,7 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '15mb' }));
 
-const VERSION = '1.6.11-audit-id-hash-fix';
+const VERSION = '1.6.12-backup-export-restore';
 const PORT = process.env.PORT || 8080;
 const JWT_SECRET = process.env.JWT_SECRET || 'DEV_ONLY_CHANGE_ME_PENGEDAG';
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -508,7 +508,7 @@ app.get('/health', async (req, res) => {
 
 app.get('/api/mobile/routes', (req, res) => res.json({ ok: true, version: VERSION, routes: [
   'GET /health', 'POST /api/auth/bootstrap-admin', 'POST /api/auth/login', 'GET /api/auth/me', 'POST /api/auth/users',
-  'POST /api/mobile/time-entry', 'GET /api/mobile/times', 'POST /api/mobile/time-entries/:id/approve', 'POST /api/mobile/time-entries/:id/reject', 'POST /api/bilag/upload', 'GET /api/bilag', 'GET /api/bilag/:id', 'GET /api/bilag/:id/download', 'GET /api/admin/audit-log', 'GET /api/admin/audit-log/verify'
+  'POST /api/mobile/time-entry', 'GET /api/mobile/times', 'POST /api/mobile/time-entries/:id/approve', 'POST /api/mobile/time-entries/:id/reject', 'POST /api/bilag/upload', 'GET /api/bilag', 'GET /api/bilag/:id', 'GET /api/bilag/:id/download', 'GET /api/admin/backup/export', 'POST /api/admin/backup/restore', 'GET /api/admin/audit-log', 'GET /api/admin/audit-log/verify'
 ]}));
 
 app.post('/api/auth/bootstrap-admin', async (req, res) => {
@@ -744,6 +744,159 @@ app.get('/api/bilag/:id/download', auth, async (req, res) => {
   res.setHeader('Content-Length', x.file_size || x.file_data.length);
   res.setHeader('Content-Disposition', `attachment; filename="${String(x.original_filename || 'bilag').replace(/"/g, '')}"`);
   res.send(x.file_data);
+});
+
+
+
+// v1.6.12: Backup / eksport / kontrolleret gendannelse
+// Designvalg: Restore sletter ALDRIG live data og overskriver ikke eksisterende id'er.
+// Den importerer kun manglende rækker og skriver handlingen i immutable audit_log.
+function backupSafeUser(row) {
+  return {
+    id: row.id,
+    email: row.email,
+    role: row.role,
+    employee_id: row.employee_id || '',
+    name: row.name || '',
+    active: !!row.active,
+    created_at: row.created_at,
+    updated_at: row.updated_at
+  };
+}
+
+async function readAllForBackup() {
+  const users = await query('SELECT id,email,role,employee_id,name,active,created_at,updated_at FROM users ORDER BY created_at ASC, id ASC');
+  const timeEntries = await query('SELECT * FROM time_entries ORDER BY created_at ASC, id ASC');
+  const attachments = await query('SELECT * FROM attachments ORDER BY created_at ASC, id ASC');
+  const overtimeRules = await query('SELECT * FROM overtime_rules ORDER BY employee_id ASC');
+  const payslips = await query('SELECT * FROM payslips ORDER BY created_at ASC, id ASC');
+  const auditRows = await query('SELECT * FROM audit_log ORDER BY sequence_number ASC, created_at ASC, id ASC');
+
+  return {
+    users: users.rows.map(backupSafeUser),
+    time_entries: timeEntries.rows,
+    attachments: attachments.rows.map(x => ({
+      id: x.id,
+      uploader_user_id: x.uploader_user_id,
+      uploader_email: x.uploader_email,
+      uploader_role: x.uploader_role,
+      original_filename: x.original_filename,
+      mime_type: x.mime_type,
+      file_size: x.file_size,
+      sha256: x.sha256,
+      storage_kind: x.storage_kind,
+      linked_type: x.linked_type,
+      linked_id: x.linked_id,
+      created_at: x.created_at,
+      file_base64: x.file_data ? Buffer.from(x.file_data).toString('base64') : ''
+    })),
+    overtime_rules: overtimeRules.rows,
+    payslips: payslips.rows,
+    audit_log_readonly: auditRows.rows
+  };
+}
+
+app.get('/api/admin/backup/export', auth, requireRole('admin','owner','auditor'), async (req, res) => {
+  const data = await readAllForBackup();
+  const manifest = {
+    app: 'Pengedag',
+    backupVersion: '1.0',
+    backendVersion: VERSION,
+    exportedAt: new Date().toISOString(),
+    exportedBy: { id: req.user.id, email: req.user.email, role: req.user.role },
+    counts: {
+      users: data.users.length,
+      time_entries: data.time_entries.length,
+      attachments: data.attachments.length,
+      overtime_rules: data.overtime_rules.length,
+      payslips: data.payslips.length,
+      audit_log_readonly: data.audit_log_readonly.length
+    },
+    notes: 'Audit log medtages read-only. Restore importerer ikke historiske audit rows; selve restore-handlingen logges som RESTORE_BACKUP_IMPORT.'
+  };
+  const backup = { manifest, data };
+  const backupHash = sha256(stableJson(backup));
+  backup.manifest.sha256 = backupHash;
+  await audit(req.user, 'CREATE_BACKUP_EXPORT', 'backup', backupHash, { counts: manifest.counts, backupHash });
+  res.json({ ok: true, backup });
+});
+
+app.post('/api/admin/backup/restore', auth, requireRole('admin'), async (req, res) => {
+  const body = req.body || {};
+  const dryRun = body.dryRun !== false;
+  const confirm = String(body.confirm || '');
+  const backup = body.backup || {};
+  const data = backup.data || body.data || {};
+
+  if (!dryRun && confirm !== 'GENDAN_PENGEDAG') {
+    return res.status(400).json({ ok: false, error: 'For rigtig gendannelse skal confirm være GENDAN_PENGEDAG. Brug dryRun=true for test.' });
+  }
+
+  const result = {
+    dryRun,
+    inserted: { time_entries: 0, attachments: 0, overtime_rules: 0, payslips: 0 },
+    skippedExisting: { time_entries: 0, attachments: 0, overtime_rules: 0, payslips: 0 },
+    warnings: []
+  };
+
+  const timeEntries = Array.isArray(data.time_entries) ? data.time_entries : [];
+  const attachments = Array.isArray(data.attachments) ? data.attachments : [];
+  const overtimeRules = Array.isArray(data.overtime_rules) ? data.overtime_rules : [];
+  const payslips = Array.isArray(data.payslips) ? data.payslips : [];
+
+  for (const x of timeEntries) {
+    if (!x.id) continue;
+    const exists = await query('SELECT id FROM time_entries WHERE id=$1 LIMIT 1', [x.id]);
+    if (exists.rows.length) { result.skippedExisting.time_entries++; continue; }
+    result.inserted.time_entries++;
+    if (!dryRun) {
+      await query(`INSERT INTO time_entries (id,user_id,employee_id,employee_name,email,customer_id,customer_name,date,start_time,end_time,pause_minutes,note,status,approved_by,rejected_by,calculation_json,created_at,updated_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
+        [x.id, x.user_id || '', x.employee_id || '', x.employee_name || '', x.email || '', x.customer_id || '', x.customer_name || '', x.date || '', x.start_time || '', x.end_time || '', Number(x.pause_minutes || 0), x.note || '', x.status || 'Afventer', x.approved_by || '', x.rejected_by || '', x.calculation_json || {}, x.created_at || new Date(), x.updated_at || new Date()]
+      );
+    }
+  }
+
+  for (const x of attachments) {
+    if (!x.id) continue;
+    const exists = await query('SELECT id FROM attachments WHERE id=$1 LIMIT 1', [x.id]);
+    if (exists.rows.length) { result.skippedExisting.attachments++; continue; }
+    const buffer = Buffer.from(String(x.file_base64 || ''), 'base64');
+    if (!buffer.length) { result.warnings.push({ attachmentId: x.id, warning: 'mangler file_base64 - sprunget over' }); continue; }
+    result.inserted.attachments++;
+    if (!dryRun) {
+      const hash = x.sha256 || sha256(buffer);
+      await query(`INSERT INTO attachments (id,uploader_user_id,uploader_email,uploader_role,original_filename,mime_type,file_size,sha256,storage_kind,linked_type,linked_id,file_data,created_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+        [x.id, x.uploader_user_id || '', x.uploader_email || '', x.uploader_role || '', x.original_filename || 'bilag', x.mime_type || 'application/octet-stream', buffer.length, hash, x.storage_kind || 'postgres_bytea', x.linked_type || '', x.linked_id || '', buffer, x.created_at || new Date()]
+      );
+    }
+  }
+
+  for (const x of overtimeRules) {
+    if (!x.employee_id) continue;
+    const exists = await query('SELECT employee_id FROM overtime_rules WHERE employee_id=$1 LIMIT 1', [x.employee_id]);
+    if (exists.rows.length) { result.skippedExisting.overtime_rules++; continue; }
+    result.inserted.overtime_rules++;
+    if (!dryRun) {
+      await query('INSERT INTO overtime_rules (employee_id, rule_json, updated_at) VALUES ($1,$2,$3)', [x.employee_id, x.rule_json || {}, x.updated_at || new Date()]);
+    }
+  }
+
+  for (const x of payslips) {
+    if (!x.id) continue;
+    const exists = await query('SELECT id FROM payslips WHERE id=$1 LIMIT 1', [x.id]);
+    if (exists.rows.length) { result.skippedExisting.payslips++; continue; }
+    result.inserted.payslips++;
+    if (!dryRun) {
+      await query('INSERT INTO payslips (id, employee_id, employee_name, period, data_json, created_by, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7)', [x.id, x.employee_id || '', x.employee_name || '', x.period || '', x.data_json || {}, x.created_by || '', x.created_at || new Date()]);
+    }
+  }
+
+  if (!dryRun) {
+    await audit(req.user, 'RESTORE_BACKUP_IMPORT', 'backup', backup.manifest?.sha256 || 'manual', result);
+  }
+  res.json({ ok: true, result });
 });
 
 app.get('/api/mobile/overtime-rules/:employeeId', auth, async (req, res) => {
