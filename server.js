@@ -1,532 +1,364 @@
-require("dotenv").config();
+require('dotenv').config();
 
-const express = require("express");
-const cors = require("cors");
-const helmet = require("helmet");
-const bcrypt = require("bcryptjs");
-const jwt = require("jsonwebtoken");
-const { Pool } = require("pg");
-const crypto = require("crypto");
+const express = require('express');
+const cors = require('cors');
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
+const { Pool } = require('pg');
 
 const app = express();
+app.use(cors());
+app.use(express.json({ limit: '2mb' }));
+
+const VERSION = '1.6.4-migrationsafe-login';
 const PORT = process.env.PORT || 8080;
-const JWT_SECRET = process.env.JWT_SECRET || "DEV_ONLY_CHANGE_ME";
+const JWT_SECRET = process.env.JWT_SECRET || 'DEV_ONLY_CHANGE_ME_PENGEDAG';
 const DATABASE_URL = process.env.DATABASE_URL;
 
-app.use(helmet());
-app.use(cors({ origin: true }));
-app.use(express.json({ limit: "1mb" }));
-
 if (!DATABASE_URL) {
-  console.warn("ADVARSEL: DATABASE_URL mangler. Til Railway: tilføj PostgreSQL DATABASE_URL på backend-servicen.");
+  console.warn('ADVARSEL: DATABASE_URL mangler. Railway backend skal have DATABASE_URL fra PostgreSQL service.');
 }
-if (JWT_SECRET === "DEV_ONLY_CHANGE_ME") {
-  console.warn("ADVARSEL: JWT_SECRET mangler. Til Railway: tilføj en lang hemmelig JWT_SECRET variable.");
+if (!process.env.JWT_SECRET) {
+  console.warn('ADVARSEL: JWT_SECRET mangler. Tilfoej JWT_SECRET i Railway Variables foer rigtig drift.');
 }
 
 const pool = new Pool({
-  connectionString: DATABASE_URL || "postgres://postgres:postgres@localhost:5432/postgres",
-  ssl: DATABASE_URL && !DATABASE_URL.includes("localhost") ? { rejectUnauthorized: false } : false
+  connectionString: DATABASE_URL,
+  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
 });
 
-function nowIso() {
-  return new Date().toISOString();
-}
-
-function makeId(prefix) {
-  return `${prefix}_${Date.now()}_${crypto.randomBytes(6).toString("hex")}`;
-}
-
 async function query(sql, params = []) {
-  const result = await pool.query(sql, params);
-  return result;
-}
-
-async function audit(action, actorUserId, targetType, targetId, details = {}) {
+  const client = await pool.connect();
   try {
-    await query(
-      `INSERT INTO audit_log (id, created_at, action, actor_user_id, target_type, target_id, details_json)
-       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-      [makeId("audit"), nowIso(), action, actorUserId || "system", targetType || "system", targetId || "", JSON.stringify(details)]
-    );
-  } catch (err) {
-    console.error("Audit log fejl:", err.message);
+    return await client.query(sql, params);
+  } finally {
+    client.release();
   }
 }
 
+async function tableExists(name) {
+  const r = await query(`SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name=$1) AS exists`, [name]);
+  return !!r.rows[0].exists;
+}
+
+async function columnExists(table, column) {
+  const r = await query(`SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name=$1 AND column_name=$2) AS exists`, [table, column]);
+  return !!r.rows[0].exists;
+}
+
+async function addColumnIfMissing(table, column, definition) {
+  const exists = await columnExists(table, column);
+  if (!exists) {
+    console.log(`Migration: tilfoejer ${table}.${column}`);
+    await query(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  }
+}
+
+async function safeCreateIndex(name, table, column) {
+  const exists = await columnExists(table, column);
+  if (!exists) {
+    console.warn(`Springer index ${name} over: ${table}.${column} findes ikke endnu`);
+    return;
+  }
+  await query(`CREATE INDEX IF NOT EXISTS ${name} ON ${table}(${column})`);
+}
+
 async function initDb() {
+  // 1) Grundtabeller foerst. Ingen indexes foer kolonner er sikret.
   await query(`
     CREATE TABLE IF NOT EXISTS users (
       id TEXT PRIMARY KEY,
-      created_at TIMESTAMPTZ NOT NULL,
-      updated_at TIMESTAMPTZ NOT NULL,
-      name TEXT NOT NULL,
       email TEXT UNIQUE NOT NULL,
       password_hash TEXT NOT NULL,
-      role TEXT NOT NULL CHECK (role IN ('owner','employee','auditor','admin')),
-      employee_id TEXT,
-      active BOOLEAN NOT NULL DEFAULT TRUE
-    );
+      role TEXT NOT NULL DEFAULT 'employee',
+      employee_id TEXT DEFAULT '',
+      name TEXT DEFAULT '',
+      active BOOLEAN NOT NULL DEFAULT TRUE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
   `);
 
   await query(`
     CREATE TABLE IF NOT EXISTS time_entries (
       id TEXT PRIMARY KEY,
-      created_at TIMESTAMPTZ NOT NULL,
-      updated_at TIMESTAMPTZ NOT NULL,
-      employee_id TEXT NOT NULL,
-      employee_name TEXT NOT NULL,
+      user_id TEXT DEFAULT '',
+      employee_id TEXT DEFAULT '',
+      employee_name TEXT DEFAULT '',
       email TEXT DEFAULT '',
       customer_id TEXT DEFAULT '',
       customer_name TEXT DEFAULT '',
-      work_date DATE NOT NULL,
-      start_time TEXT NOT NULL,
-      end_time TEXT NOT NULL,
-      pause_minutes INTEGER NOT NULL DEFAULT 0,
+      date TEXT DEFAULT '',
+      start_time TEXT DEFAULT '',
+      end_time TEXT DEFAULT '',
+      pause_minutes INTEGER DEFAULT 0,
       note TEXT DEFAULT '',
-      status TEXT NOT NULL DEFAULT 'Afventer',
+      status TEXT DEFAULT 'Afventer',
       approved_by TEXT DEFAULT '',
-      approved_at TIMESTAMPTZ,
       rejected_by TEXT DEFAULT '',
-      rejected_at TIMESTAMPTZ,
-      calculation_json JSONB NOT NULL DEFAULT '{}'::jsonb
-    );
-  `);
-
-  await query(`
-    CREATE TABLE IF NOT EXISTS overtime_rules (
-      employee_id TEXT PRIMARY KEY,
-      created_at TIMESTAMPTZ NOT NULL,
-      updated_at TIMESTAMPTZ NOT NULL,
-      normal_rate NUMERIC NOT NULL DEFAULT 160,
-      overtime_rate NUMERIC NOT NULL DEFAULT 220,
-      customer_rate NUMERIC NOT NULL DEFAULT 320,
-      overtime_after_hours NUMERIC NOT NULL DEFAULT 8,
-      night_start TEXT NOT NULL DEFAULT '22:00',
-      night_end TEXT NOT NULL DEFAULT '06:00',
-      night_overtime_enabled BOOLEAN NOT NULL DEFAULT TRUE
-    );
-  `);
-
-  await query(`
-    CREATE TABLE IF NOT EXISTS payslips (
-      id TEXT PRIMARY KEY,
-      created_at TIMESTAMPTZ NOT NULL,
-      updated_at TIMESTAMPTZ NOT NULL,
-      employee_id TEXT NOT NULL,
-      period TEXT NOT NULL,
-      status TEXT NOT NULL DEFAULT 'Afventer kontrol',
-      data_json JSONB NOT NULL DEFAULT '{}'::jsonb
-    );
-  `);
-
-  // v1.6.3 MIGRATION FIX:
-  // v1.6.0 created audit_log with BIGSERIAL id and columns entity_type/entity_id/payload.
-  // v1.6.1/v1.6.2 expects TEXT id and actor_user_id/target_type/target_id/details_json.
-  // If the old table exists, preserve it as audit_log_legacy_v160 and create a new compatible audit_log.
-  await query(`
-    DO $$
-    BEGIN
-      IF EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_name='audit_log' AND column_name='id' AND data_type <> 'text'
-      ) THEN
-        IF NOT EXISTS (
-          SELECT 1 FROM information_schema.tables
-          WHERE table_name='audit_log_legacy_v160'
-        ) THEN
-          ALTER TABLE audit_log RENAME TO audit_log_legacy_v160;
-        ELSE
-          DROP TABLE audit_log;
-        END IF;
-      END IF;
-    END $$;
+      calculation_json JSONB DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
   `);
 
   await query(`
     CREATE TABLE IF NOT EXISTS audit_log (
       id TEXT PRIMARY KEY,
-      created_at TIMESTAMPTZ NOT NULL,
+      actor_user_id TEXT DEFAULT '',
+      actor_email TEXT DEFAULT '',
       action TEXT NOT NULL,
-      actor_user_id TEXT NOT NULL,
-      target_type TEXT NOT NULL,
-      target_id TEXT NOT NULL,
-      details_json JSONB NOT NULL DEFAULT '{}'::jsonb
-    );
+      target_type TEXT DEFAULT '',
+      target_id TEXT DEFAULT '',
+      details_json JSONB DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
   `);
 
-  // v1.6.2 MIGRATION FIX:
-  // Existing Railway PostgreSQL databases from v1.6.0 already have tables.
-  // CREATE TABLE IF NOT EXISTS does NOT add new columns to old tables.
-  // Therefore we add missing columns safely before creating indexes or using them.
-  await query(`ALTER TABLE time_entries ADD COLUMN IF NOT EXISTS user_id TEXT DEFAULT '';`);
-  await query(`ALTER TABLE time_entries ADD COLUMN IF NOT EXISTS email TEXT DEFAULT '';`);
-  await query(`ALTER TABLE time_entries ADD COLUMN IF NOT EXISTS customer_id TEXT DEFAULT '';`);
-  await query(`ALTER TABLE time_entries ADD COLUMN IF NOT EXISTS customer_name TEXT DEFAULT '';`);
-  await query(`ALTER TABLE time_entries ADD COLUMN IF NOT EXISTS approved_by TEXT DEFAULT '';`);
-  await query(`ALTER TABLE time_entries ADD COLUMN IF NOT EXISTS approved_at TIMESTAMPTZ;`);
-  await query(`ALTER TABLE time_entries ADD COLUMN IF NOT EXISTS rejected_by TEXT DEFAULT '';`);
-  await query(`ALTER TABLE time_entries ADD COLUMN IF NOT EXISTS rejected_at TIMESTAMPTZ;`);
-  await query(`ALTER TABLE time_entries ADD COLUMN IF NOT EXISTS calculation_json JSONB NOT NULL DEFAULT '{}'::jsonb;`);
+  await query(`
+    CREATE TABLE IF NOT EXISTS overtime_rules (
+      employee_id TEXT PRIMARY KEY,
+      rule_json JSONB DEFAULT '{}'::jsonb,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
 
-  await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS employee_id TEXT;`);
-  await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE;`);
+  await query(`
+    CREATE TABLE IF NOT EXISTS payslips (
+      id TEXT PRIMARY KEY,
+      employee_id TEXT DEFAULT '',
+      employee_name TEXT DEFAULT '',
+      period TEXT DEFAULT '',
+      data_json JSONB DEFAULT '{}'::jsonb,
+      created_by TEXT DEFAULT '',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
 
-  // v1.6.3: upgrade old overtime_rules table from v1.6.0 if it only had rules JSONB.
-  await query(`ALTER TABLE overtime_rules ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();`);
-  await query(`ALTER TABLE overtime_rules ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();`);
-  await query(`ALTER TABLE overtime_rules ADD COLUMN IF NOT EXISTS normal_rate NUMERIC NOT NULL DEFAULT 160;`);
-  await query(`ALTER TABLE overtime_rules ADD COLUMN IF NOT EXISTS overtime_rate NUMERIC NOT NULL DEFAULT 220;`);
-  await query(`ALTER TABLE overtime_rules ADD COLUMN IF NOT EXISTS customer_rate NUMERIC NOT NULL DEFAULT 320;`);
-  await query(`ALTER TABLE overtime_rules ADD COLUMN IF NOT EXISTS overtime_after_hours NUMERIC NOT NULL DEFAULT 8;`);
-  await query(`ALTER TABLE overtime_rules ADD COLUMN IF NOT EXISTS night_start TEXT NOT NULL DEFAULT '22:00';`);
-  await query(`ALTER TABLE overtime_rules ADD COLUMN IF NOT EXISTS night_end TEXT NOT NULL DEFAULT '06:00';`);
-  await query(`ALTER TABLE overtime_rules ADD COLUMN IF NOT EXISTS night_overtime_enabled BOOLEAN NOT NULL DEFAULT TRUE;`);
+  // 2) Migrations til gamle v1.6.0/v1.6.1 tabeller. Disse koerer foer indexes.
+  await addColumnIfMissing('time_entries', 'user_id', "TEXT DEFAULT ''");
+  await addColumnIfMissing('time_entries', 'employee_id', "TEXT DEFAULT ''");
+  await addColumnIfMissing('time_entries', 'employee_name', "TEXT DEFAULT ''");
+  await addColumnIfMissing('time_entries', 'email', "TEXT DEFAULT ''");
+  await addColumnIfMissing('time_entries', 'customer_id', "TEXT DEFAULT ''");
+  await addColumnIfMissing('time_entries', 'customer_name', "TEXT DEFAULT ''");
+  await addColumnIfMissing('time_entries', 'date', "TEXT DEFAULT ''");
+  await addColumnIfMissing('time_entries', 'start_time', "TEXT DEFAULT ''");
+  await addColumnIfMissing('time_entries', 'end_time', "TEXT DEFAULT ''");
+  await addColumnIfMissing('time_entries', 'pause_minutes', "INTEGER DEFAULT 0");
+  await addColumnIfMissing('time_entries', 'note', "TEXT DEFAULT ''");
+  await addColumnIfMissing('time_entries', 'status', "TEXT DEFAULT 'Afventer'");
+  await addColumnIfMissing('time_entries', 'approved_by', "TEXT DEFAULT ''");
+  await addColumnIfMissing('time_entries', 'rejected_by', "TEXT DEFAULT ''");
+  await addColumnIfMissing('time_entries', 'calculation_json', "JSONB DEFAULT '{}'::jsonb");
+  await addColumnIfMissing('time_entries', 'created_at', 'TIMESTAMPTZ NOT NULL DEFAULT NOW()');
+  await addColumnIfMissing('time_entries', 'updated_at', 'TIMESTAMPTZ NOT NULL DEFAULT NOW()');
 
-  // v1.6.3: upgrade old payslips table from v1.6.0.
-  await query(`ALTER TABLE payslips ADD COLUMN IF NOT EXISTS period TEXT NOT NULL DEFAULT '';`);
-  await query(`ALTER TABLE payslips ADD COLUMN IF NOT EXISTS data_json JSONB NOT NULL DEFAULT '{}'::jsonb;`);
+  await addColumnIfMissing('audit_log', 'actor_user_id', "TEXT DEFAULT ''");
+  await addColumnIfMissing('audit_log', 'actor_email', "TEXT DEFAULT ''");
+  await addColumnIfMissing('audit_log', 'action', "TEXT DEFAULT ''");
+  await addColumnIfMissing('audit_log', 'target_type', "TEXT DEFAULT ''");
+  await addColumnIfMissing('audit_log', 'target_id', "TEXT DEFAULT ''");
+  await addColumnIfMissing('audit_log', 'details_json', "JSONB DEFAULT '{}'::jsonb");
+  await addColumnIfMissing('audit_log', 'created_at', 'TIMESTAMPTZ NOT NULL DEFAULT NOW()');
 
-  // v1.6.3: make sure audit_log has all new columns before indexes/inserts.
-  await query(`ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS actor_user_id TEXT NOT NULL DEFAULT 'system';`);
-  await query(`ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS target_type TEXT NOT NULL DEFAULT 'system';`);
-  await query(`ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS target_id TEXT NOT NULL DEFAULT '';`);
-  await query(`ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS details_json JSONB NOT NULL DEFAULT '{}'::jsonb;`);
+  await addColumnIfMissing('users', 'employee_id', "TEXT DEFAULT ''");
+  await addColumnIfMissing('users', 'name', "TEXT DEFAULT ''");
+  await addColumnIfMissing('users', 'active', 'BOOLEAN NOT NULL DEFAULT TRUE');
 
-  await query(`CREATE INDEX IF NOT EXISTS idx_time_entries_user_id ON time_entries(user_id);`);
-  await query(`CREATE INDEX IF NOT EXISTS idx_time_entries_employee_id ON time_entries(employee_id);`);
-  await query(`CREATE INDEX IF NOT EXISTS idx_time_entries_status ON time_entries(status);`);
-  await query(`CREATE INDEX IF NOT EXISTS idx_audit_log_actor_user_id ON audit_log(actor_user_id);`);
+  // 3) Foerst nu indexes. SafeCreate checker kolonnen foer index.
+  await safeCreateIndex('idx_time_entries_user_id', 'time_entries', 'user_id');
+  await safeCreateIndex('idx_time_entries_employee_id', 'time_entries', 'employee_id');
+  await safeCreateIndex('idx_time_entries_status', 'time_entries', 'status');
+  await safeCreateIndex('idx_audit_log_actor_user_id', 'audit_log', 'actor_user_id');
+  await safeCreateIndex('idx_audit_log_action', 'audit_log', 'action');
+  await safeCreateIndex('idx_audit_log_target_id', 'audit_log', 'target_id');
 
+  console.log('Database migrations OK - Pengedag ' + VERSION);
 }
 
-function createToken(user) {
-  return jwt.sign(
-    {
-      sub: user.id,
-      email: user.email,
-      role: user.role,
-      name: user.name,
-      employeeId: user.employee_id || ""
-    },
-    JWT_SECRET,
-    { expiresIn: "12h" }
-  );
+function makeId(prefix) {
+  return prefix + '_' + Date.now() + '_' + Math.random().toString(16).slice(2);
 }
 
-async function requireAuth(req, res, next) {
+function calcHours(start, end, pauseMinutes) {
+  const [sh, sm] = String(start || '00:00').split(':').map(Number);
+  const [eh, em] = String(end || '00:00').split(':').map(Number);
+  let a = sh * 60 + sm;
+  let b = eh * 60 + em;
+  if (b < a) b += 24 * 60;
+  const minutes = Math.max(0, b - a - (Number(pauseMinutes) || 0));
+  return Math.round((minutes / 60) * 100) / 100;
+}
+
+async function audit(actor, action, targetType, targetId, details = {}) {
   try {
-    const header = req.headers.authorization || "";
-    const token = header.startsWith("Bearer ") ? header.slice(7) : "";
-    if (!token) return res.status(401).json({ ok: false, error: "Mangler login token" });
-    const payload = jwt.verify(token, JWT_SECRET);
-    const result = await query("SELECT * FROM users WHERE id=$1 AND active=true", [payload.sub]);
-    if (!result.rows.length) return res.status(401).json({ ok: false, error: "Bruger findes ikke eller er deaktiveret" });
-    req.user = result.rows[0];
+    await query(
+      `INSERT INTO audit_log (id, actor_user_id, actor_email, action, target_type, target_id, details_json)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      [makeId('audit'), actor?.id || '', actor?.email || '', action, targetType || '', targetId || '', details]
+    );
+  } catch (e) {
+    console.warn('Audit log kunne ikke gemmes:', e.message);
+  }
+}
+
+function signToken(user) {
+  return jwt.sign({ id: user.id, email: user.email, role: user.role, employeeId: user.employee_id || '' }, JWT_SECRET, { expiresIn: '12h' });
+}
+
+async function auth(req, res, next) {
+  const h = req.headers.authorization || '';
+  const token = h.startsWith('Bearer ') ? h.slice(7) : '';
+  if (!token) return res.status(401).json({ ok: false, error: 'Mangler Bearer token' });
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const r = await query('SELECT id,email,role,employee_id,name,active FROM users WHERE id=$1', [decoded.id]);
+    if (!r.rows.length || !r.rows[0].active) return res.status(401).json({ ok: false, error: 'Ugyldig bruger' });
+    req.user = r.rows[0];
     next();
-  } catch (err) {
-    return res.status(401).json({ ok: false, error: "Ugyldigt eller udløbet login" });
+  } catch (e) {
+    return res.status(401).json({ ok: false, error: 'Ugyldigt token' });
   }
 }
 
 function requireRole(...roles) {
   return (req, res, next) => {
-    if (!req.user) return res.status(401).json({ ok: false, error: "Login kræves" });
-    if (!roles.includes(req.user.role)) {
-      return res.status(403).json({ ok: false, error: "Ingen adgang", requiredRoles: roles, yourRole: req.user.role });
-    }
+    if (!req.user) return res.status(401).json({ ok: false, error: 'Ikke logget ind' });
+    if (!roles.includes(req.user.role)) return res.status(403).json({ ok: false, error: 'Ingen adgang', role: req.user.role });
     next();
   };
 }
 
-function toPublicUser(row) {
-  return {
-    id: row.id,
-    name: row.name,
-    email: row.email,
-    role: row.role,
-    employeeId: row.employee_id || "",
-    active: row.active,
-    createdAt: row.created_at
-  };
-}
-
-function calcHours(start, end, pauseMinutes) {
-  const [sh, sm] = String(start).split(":").map(Number);
-  const [eh, em] = String(end).split(":").map(Number);
-  let startM = sh * 60 + sm;
-  let endM = eh * 60 + em;
-  if (endM < startM) endM += 24 * 60;
-  const worked = Math.max(0, endM - startM - (Number(pauseMinutes) || 0));
-  return Math.round((worked / 60) * 100) / 100;
-}
-
-async function getRule(employeeId) {
-  const r = await query("SELECT * FROM overtime_rules WHERE employee_id=$1", [employeeId]);
-  if (r.rows.length) return r.rows[0];
-  return {
-    normal_rate: 160,
-    overtime_rate: 220,
-    customer_rate: 320,
-    overtime_after_hours: 8,
-    night_overtime_enabled: true
-  };
-}
-
-async function buildCalculation(employeeId, start, end, pauseMinutes) {
-  const rule = await getRule(employeeId);
-  const hours = calcHours(start, end, pauseMinutes);
-  const overtimeHours = Math.max(0, hours - Number(rule.overtime_after_hours || 8));
-  const normalHours = Math.max(0, hours - overtimeHours);
-  const employeePay = Math.round((normalHours * Number(rule.normal_rate || 160) + overtimeHours * Number(rule.overtime_rate || 220)) * 100) / 100;
-  const customerTotalExVat = Math.round(hours * Number(rule.customer_rate || 320) * 100) / 100;
-  const customerVat = Math.round(customerTotalExVat * 0.25 * 100) / 100;
-  const customerTotalIncVat = Math.round((customerTotalExVat + customerVat) * 100) / 100;
-  const marginExVat = Math.round((customerTotalExVat - employeePay) * 100) / 100;
-  return { hours, normalHours, overtimeHours, employeePay, customerTotalExVat, customerVat, customerTotalIncVat, marginExVat };
-}
-
-app.get("/", async (req, res) => {
-  let database = "unknown";
+app.get('/', (req, res) => res.json({ ok: true, app: 'Pengedag Backend PostgreSQL Login', version: VERSION, database: 'postgresql' }));
+app.get('/health', async (req, res) => {
   try {
-    await query("SELECT 1");
-    database = "postgresql";
-  } catch (_) {
-    database = "disconnected";
-  }
-  res.json({ ok: true, app: "Pengedag Backend Login", version: "1.6.3-auditlog-migrationfix", database });
-});
-
-app.get("/health", async (req, res) => {
-  try {
-    await query("SELECT 1");
-    res.json({ ok: true, app: "Pengedag Backend Login", version: "1.6.3-auditlog-migrationfix", database: "postgresql" });
-  } catch (err) {
-    res.status(500).json({ ok: false, app: "Pengedag Backend Login", database: "disconnected", error: err.message });
+    await query('SELECT 1 AS ok');
+    res.json({ ok: true, status: 'healthy', version: VERSION, database: 'connected', time: new Date().toISOString() });
+  } catch (e) {
+    res.status(500).json({ ok: false, status: 'database_error', version: VERSION, error: e.message });
   }
 });
 
-app.get("/api/mobile/routes", (req, res) => {
-  res.json({
-    ok: true,
-    version: "1.6.3-auditlog-migrationfix",
-    auth: "Bearer token required on protected routes",
-    routes: [
-      "POST /api/auth/bootstrap-admin",
-      "POST /api/auth/login",
-      "GET /api/auth/me",
-      "POST /api/auth/users",
-      "GET /api/auth/users",
-      "GET /api/mobile/time-entries",
-      "GET /api/mobile/times",
-      "POST /api/mobile/time-entry",
-      "POST /api/mobile/time-entries/:id/approve",
-      "POST /api/mobile/time-entries/:id/reject",
-      "GET /api/admin/audit-log"
-    ]
-  });
-});
+app.get('/api/mobile/routes', (req, res) => res.json({ ok: true, version: VERSION, routes: [
+  'GET /health', 'POST /api/auth/bootstrap-admin', 'POST /api/auth/login', 'GET /api/auth/me', 'POST /api/auth/users',
+  'POST /api/mobile/time-entry', 'GET /api/mobile/times', 'POST /api/mobile/time-entries/:id/approve', 'POST /api/mobile/time-entries/:id/reject', 'GET /api/admin/audit-log'
+]}));
 
-app.post("/api/auth/bootstrap-admin", async (req, res) => {
+app.post('/api/auth/bootstrap-admin', async (req, res) => {
   const existing = await query("SELECT COUNT(*)::int AS count FROM users WHERE role='admin'");
-  if (existing.rows[0].count > 0) {
-    return res.status(403).json({ ok: false, error: "Admin findes allerede. Brug login." });
-  }
-  const { name, email, password } = req.body || {};
-  if (!name || !email || !password || password.length < 8) {
-    return res.status(400).json({ ok: false, error: "name, email og password på mindst 8 tegn kræves" });
-  }
-  const id = makeId("usr");
+  if (existing.rows[0].count > 0) return res.status(403).json({ ok: false, error: 'Admin findes allerede' });
+  const { email, password, name } = req.body || {};
+  if (!email || !password) return res.status(400).json({ ok: false, error: 'email og password kraeves' });
+  const id = makeId('usr');
   const hash = await bcrypt.hash(password, 12);
-  await query(
-    `INSERT INTO users (id, created_at, updated_at, name, email, password_hash, role, employee_id, active)
-     VALUES ($1,$2,$3,$4,$5,$6,'admin','',true)`,
-    [id, nowIso(), nowIso(), name, String(email).toLowerCase(), hash]
-  );
-  await audit("bootstrap_admin", id, "user", id, { email });
-  const user = (await query("SELECT * FROM users WHERE id=$1", [id])).rows[0];
-  res.json({ ok: true, user: toPublicUser(user), token: createToken(user) });
+  await query('INSERT INTO users (id,email,password_hash,role,name) VALUES ($1,$2,$3,$4,$5)', [id, email.toLowerCase(), hash, 'admin', name || 'Admin']);
+  await audit({ id, email }, 'bootstrap_admin', 'user', id, { email });
+  res.json({ ok: true, user: { id, email: email.toLowerCase(), role: 'admin', name: name || 'Admin' }, token: signToken({ id, email: email.toLowerCase(), role: 'admin', employee_id: '' }) });
 });
 
-app.post("/api/auth/login", async (req, res) => {
+app.post('/api/auth/login', async (req, res) => {
   const { email, password } = req.body || {};
-  if (!email || !password) return res.status(400).json({ ok: false, error: "email og password kræves" });
-  const result = await query("SELECT * FROM users WHERE email=$1 AND active=true", [String(email).toLowerCase()]);
-  if (!result.rows.length) return res.status(401).json({ ok: false, error: "Forkert login" });
-  const user = result.rows[0];
-  const ok = await bcrypt.compare(password, user.password_hash);
-  if (!ok) return res.status(401).json({ ok: false, error: "Forkert login" });
-  await audit("login", user.id, "user", user.id, { email: user.email });
-  res.json({ ok: true, user: toPublicUser(user), token: createToken(user) });
+  const r = await query('SELECT * FROM users WHERE email=$1', [String(email || '').toLowerCase()]);
+  if (!r.rows.length) return res.status(401).json({ ok: false, error: 'Forkert login' });
+  const user = r.rows[0];
+  const ok = await bcrypt.compare(password || '', user.password_hash);
+  if (!ok) return res.status(401).json({ ok: false, error: 'Forkert login' });
+  await audit(user, 'login', 'user', user.id, {});
+  res.json({ ok: true, user: { id: user.id, email: user.email, role: user.role, employeeId: user.employee_id, name: user.name }, token: signToken(user) });
 });
 
-app.get("/api/auth/me", requireAuth, (req, res) => {
-  res.json({ ok: true, user: toPublicUser(req.user) });
-});
+app.get('/api/auth/me', auth, (req, res) => res.json({ ok: true, user: req.user }));
 
-app.post("/api/auth/users", requireAuth, requireRole("admin", "owner"), async (req, res) => {
-  const { name, email, password, role, employeeId } = req.body || {};
-  const allowed = ["owner", "employee", "auditor", "admin"];
-  if (!name || !email || !password || !allowed.includes(role)) {
-    return res.status(400).json({ ok: false, error: "name, email, password og gyldig role kræves" });
-  }
-  if (password.length < 8) return res.status(400).json({ ok: false, error: "password skal være mindst 8 tegn" });
-  const id = makeId("usr");
+app.post('/api/auth/users', auth, requireRole('admin', 'owner'), async (req, res) => {
+  const { email, password, role, employeeId, name } = req.body || {};
+  const allowed = ['admin', 'owner', 'employee', 'auditor'];
+  if (!email || !password || !allowed.includes(role)) return res.status(400).json({ ok: false, error: 'email, password og gyldig role kraeves' });
+  const id = makeId('usr');
   const hash = await bcrypt.hash(password, 12);
-  try {
-    await query(
-      `INSERT INTO users (id, created_at, updated_at, name, email, password_hash, role, employee_id, active)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,true)`,
-      [id, nowIso(), nowIso(), name, String(email).toLowerCase(), hash, role, employeeId || ""]
-    );
-    await audit("create_user", req.user.id, "user", id, { email, role });
-    const user = (await query("SELECT * FROM users WHERE id=$1", [id])).rows[0];
-    res.json({ ok: true, user: toPublicUser(user) });
-  } catch (err) {
-    res.status(400).json({ ok: false, error: "Kunne ikke oprette bruger", details: err.message });
-  }
+  await query('INSERT INTO users (id,email,password_hash,role,employee_id,name) VALUES ($1,$2,$3,$4,$5,$6)', [id, email.toLowerCase(), hash, role, employeeId || '', name || '']);
+  await audit(req.user, 'create_user', 'user', id, { email, role, employeeId, name });
+  res.json({ ok: true, user: { id, email: email.toLowerCase(), role, employeeId: employeeId || '', name: name || '' } });
 });
 
-app.get("/api/auth/users", requireAuth, requireRole("admin", "owner", "auditor"), async (req, res) => {
-  const result = await query("SELECT * FROM users ORDER BY created_at DESC");
-  res.json({ ok: true, count: result.rows.length, users: result.rows.map(toPublicUser) });
-});
-
-app.post(["/api/mobile/time-entry", "/api/mobile/time-entries", "/api/mobile/times", "/api/mobile/timesheets", "/api/mobile/entries"], requireAuth, requireRole("employee", "owner", "admin"), async (req, res) => {
+app.post(['/api/mobile/time-entry','/api/mobile/time-entries','/api/mobile/times','/api/mobile/timesheets','/api/mobile/entries'], auth, async (req, res) => {
   const body = req.body || {};
-  const employeeId = req.user.role === "employee" ? (req.user.employee_id || body.employeeId || req.user.id) : (body.employeeId || body.employee_id || "");
-  const employeeName = req.user.role === "employee" ? req.user.name : (body.employeeName || body.employee_name || "");
-  const date = body.date || body.workDate || body.work_date;
-  const start = body.start || body.startTime || body.start_time;
-  const end = body.end || body.endTime || body.end_time;
+  const id = makeId('mob');
+  const employeeId = body.employeeId || body.employee_id || req.user.employee_id || '';
+  if (req.user.role === 'employee' && req.user.employee_id && employeeId && employeeId !== req.user.employee_id) {
+    return res.status(403).json({ ok: false, error: 'Medarbejder kan kun sende egne timer' });
+  }
+  const employeeName = body.employeeName || body.employee_name || req.user.name || '';
+  const start = body.start || body.startTime || body.start_time || '';
+  const end = body.end || body.endTime || body.end_time || '';
   const pauseMinutes = Number(body.pauseMinutes || body.pause_minutes || 0);
-  if (!employeeId || !employeeName || !date || !start || !end) {
-    return res.status(400).json({ ok: false, error: "employeeId, employeeName, date, start og end kræves" });
-  }
-  const id = makeId("mob");
-  const calc = await buildCalculation(employeeId, start, end, pauseMinutes);
-  await query(
-    `INSERT INTO time_entries (id, created_at, updated_at, user_id, employee_id, employee_name, email, customer_id, customer_name, work_date, start_time, end_time, pause_minutes, note, status, calculation_json)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'Afventer',$15)`,
-    [id, nowIso(), nowIso(), req.user.id, employeeId, employeeName, body.email || req.user.email || "", body.customerId || "", body.customerName || "", date, start, end, pauseMinutes, body.note || "", JSON.stringify(calc)]
+  const hours = calcHours(start, end, pauseMinutes);
+  const calc = { hours, normalHours: hours, overtimeHours: 0 };
+  await query(`INSERT INTO time_entries (id,user_id,employee_id,employee_name,email,customer_id,customer_name,date,start_time,end_time,pause_minutes,note,status,calculation_json)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+    [id, req.user.id, employeeId, employeeName, body.email || '', body.customerId || '', body.customerName || '', body.date || '', start, end, pauseMinutes, body.note || '', 'Afventer', calc]
   );
-  await audit("create_time_entry", req.user.id, "time_entry", id, { employeeId, date, start, end });
-  const entry = (await query("SELECT * FROM time_entries WHERE id=$1", [id])).rows[0];
-  res.json({ ok: true, entry: normalizeEntry(entry) });
+  await audit(req.user, 'create_time_entry', 'time_entry', id, { employeeId, employeeName, date: body.date, hours });
+  res.json({ ok: true, entry: { id, employeeId, employeeName, date: body.date || '', start, end, pauseMinutes, note: body.note || '', status: 'Afventer', calculation: calc } });
 });
 
-function normalizeEntry(row) {
-  return {
-    id: row.id,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
-    userId: row.user_id || "",
-    employeeId: row.employee_id,
-    employeeName: row.employee_name,
-    email: row.email,
-    customerId: row.customer_id,
-    customerName: row.customer_name,
-    date: row.work_date,
-    start: row.start_time,
-    end: row.end_time,
-    pauseMinutes: row.pause_minutes,
-    note: row.note,
-    status: row.status,
-    approvedBy: row.approved_by,
-    approvedAt: row.approved_at,
-    rejectedBy: row.rejected_by,
-    rejectedAt: row.rejected_at,
-    calculation: row.calculation_json || {}
-  };
-}
-
-app.get(["/api/mobile/time-entries", "/api/mobile/times", "/api/mobile/timesheets", "/api/mobile/entries"], requireAuth, requireRole("owner", "admin", "auditor", "employee"), async (req, res) => {
-  let result;
-  if (req.user.role === "employee") {
-    result = await query("SELECT * FROM time_entries WHERE employee_id=$1 ORDER BY created_at DESC", [req.user.employee_id || req.user.id]);
+app.get(['/api/mobile/times','/api/mobile/time-entries','/api/mobile/timesheets','/api/mobile/entries'], auth, async (req, res) => {
+  let r;
+  if (req.user.role === 'employee') {
+    r = await query('SELECT * FROM time_entries WHERE user_id=$1 OR employee_id=$2 ORDER BY created_at DESC LIMIT 200', [req.user.id, req.user.employee_id || '']);
   } else {
-    result = await query("SELECT * FROM time_entries ORDER BY created_at DESC");
+    r = await query('SELECT * FROM time_entries ORDER BY created_at DESC LIMIT 200');
   }
-  res.json({ ok: true, count: result.rows.length, entries: result.rows.map(normalizeEntry) });
+  const entries = r.rows.map(x => ({
+    id: x.id, employeeId: x.employee_id, employeeName: x.employee_name, email: x.email,
+    customerId: x.customer_id, customerName: x.customer_name, date: x.date, start: x.start_time, end: x.end_time,
+    pauseMinutes: x.pause_minutes, note: x.note, status: x.status, calculation: x.calculation_json, createdAt: x.created_at
+  }));
+  res.json({ ok: true, count: entries.length, entries });
 });
 
-app.post("/api/mobile/time-entries/:id/approve", requireAuth, requireRole("owner", "admin"), async (req, res) => {
-  const id = req.params.id;
-  const result = await query(
-    `UPDATE time_entries SET status='Godkendt', approved_by=$1, approved_at=$2, updated_at=$2 WHERE id=$3 RETURNING *`,
-    [req.user.id, nowIso(), id]
-  );
-  if (!result.rows.length) return res.status(404).json({ ok: false, error: "Timeseddel ikke fundet" });
-  await audit("approve_time_entry", req.user.id, "time_entry", id, {});
-  res.json({ ok: true, entry: normalizeEntry(result.rows[0]) });
+app.post('/api/mobile/time-entries/:id/approve', auth, requireRole('admin','owner'), async (req, res) => {
+  await query("UPDATE time_entries SET status='Godkendt', approved_by=$2, updated_at=NOW() WHERE id=$1", [req.params.id, req.user.id]);
+  await audit(req.user, 'approve_time_entry', 'time_entry', req.params.id, {});
+  res.json({ ok: true, id: req.params.id, status: 'Godkendt' });
 });
 
-app.post("/api/mobile/time-entries/:id/reject", requireAuth, requireRole("owner", "admin"), async (req, res) => {
-  const id = req.params.id;
-  const result = await query(
-    `UPDATE time_entries SET status='Afvist', rejected_by=$1, rejected_at=$2, updated_at=$2 WHERE id=$3 RETURNING *`,
-    [req.user.id, nowIso(), id]
-  );
-  if (!result.rows.length) return res.status(404).json({ ok: false, error: "Timeseddel ikke fundet" });
-  await audit("reject_time_entry", req.user.id, "time_entry", id, { reason: req.body?.reason || "" });
-  res.json({ ok: true, entry: normalizeEntry(result.rows[0]) });
+app.post('/api/mobile/time-entries/:id/reject', auth, requireRole('admin','owner'), async (req, res) => {
+  await query("UPDATE time_entries SET status='Afvist', rejected_by=$2, updated_at=NOW() WHERE id=$1", [req.params.id, req.user.id]);
+  await audit(req.user, 'reject_time_entry', 'time_entry', req.params.id, { reason: req.body?.reason || '' });
+  res.json({ ok: true, id: req.params.id, status: 'Afvist' });
 });
 
-app.get("/api/mobile/overtime-rules/:employeeId", requireAuth, requireRole("owner", "admin", "auditor", "employee"), async (req, res) => {
-  if (req.user.role === "employee" && req.params.employeeId !== (req.user.employee_id || req.user.id)) {
-    return res.status(403).json({ ok: false, error: "Medarbejder må kun se egne regler" });
-  }
-  const rule = await getRule(req.params.employeeId);
-  res.json({ ok: true, rule });
+app.get('/api/admin/audit-log', auth, requireRole('admin','auditor'), async (req, res) => {
+  const r = await query('SELECT * FROM audit_log ORDER BY created_at DESC LIMIT 300');
+  res.json({ ok: true, count: r.rows.length, entries: r.rows });
 });
 
-app.post("/api/mobile/overtime-rules", requireAuth, requireRole("owner", "admin"), async (req, res) => {
-  const b = req.body || {};
-  if (!b.employeeId) return res.status(400).json({ ok: false, error: "employeeId kræves" });
-  await query(
-    `INSERT INTO overtime_rules (employee_id, created_at, updated_at, normal_rate, overtime_rate, customer_rate, overtime_after_hours, night_start, night_end, night_overtime_enabled)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-     ON CONFLICT (employee_id) DO UPDATE SET updated_at=$3, normal_rate=$4, overtime_rate=$5, customer_rate=$6, overtime_after_hours=$7, night_start=$8, night_end=$9, night_overtime_enabled=$10`,
-    [b.employeeId, nowIso(), nowIso(), b.normalRate || 160, b.overtimeRate || 220, b.customerRate || 320, b.overtimeAfterHours || 8, b.nightStart || "22:00", b.nightEnd || "06:00", b.nightOvertimeEnabled !== false]
-  );
-  await audit("set_overtime_rule", req.user.id, "employee", b.employeeId, b);
-  res.json({ ok: true });
+app.get('/api/mobile/overtime-rules/:employeeId', auth, async (req, res) => {
+  const r = await query('SELECT * FROM overtime_rules WHERE employee_id=$1', [req.params.employeeId]);
+  res.json({ ok: true, rule: r.rows[0]?.rule_json || {} });
 });
-
-app.post("/api/mobile/payslip", requireAuth, requireRole("owner", "admin"), async (req, res) => {
-  const b = req.body || {};
-  const id = makeId("pay");
-  if (!b.employeeId || !b.period) return res.status(400).json({ ok: false, error: "employeeId og period kræves" });
-  await query(
-    `INSERT INTO payslips (id, created_at, updated_at, employee_id, period, status, data_json) VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-    [id, nowIso(), nowIso(), b.employeeId, b.period, b.status || "Afventer kontrol", JSON.stringify(b.data || b)]
-  );
-  await audit("create_payslip", req.user.id, "payslip", id, { employeeId: b.employeeId, period: b.period });
-  res.json({ ok: true, id });
+app.post('/api/mobile/overtime-rules', auth, requireRole('admin','owner'), async (req, res) => {
+  const employeeId = req.body.employeeId || req.body.employee_id || '';
+  if (!employeeId) return res.status(400).json({ ok:false, error:'employeeId mangler' });
+  await query(`INSERT INTO overtime_rules (employee_id, rule_json, updated_at) VALUES ($1,$2,NOW()) ON CONFLICT (employee_id) DO UPDATE SET rule_json=$2, updated_at=NOW()`, [employeeId, req.body.rule || req.body]);
+  await audit(req.user, 'save_overtime_rule', 'employee', employeeId, req.body);
+  res.json({ ok:true, employeeId });
 });
-
-app.get("/api/mobile/payslip/:employeeId", requireAuth, requireRole("owner", "admin", "auditor", "employee"), async (req, res) => {
-  if (req.user.role === "employee" && req.params.employeeId !== (req.user.employee_id || req.user.id)) {
-    return res.status(403).json({ ok: false, error: "Medarbejder må kun se egne lønsedler" });
-  }
-  const r = await query("SELECT * FROM payslips WHERE employee_id=$1 ORDER BY created_at DESC", [req.params.employeeId]);
-  res.json({ ok: true, count: r.rows.length, payslips: r.rows });
+app.post('/api/mobile/payslip', auth, requireRole('admin','owner'), async (req, res) => {
+  const id = makeId('pay');
+  await query('INSERT INTO payslips (id, employee_id, employee_name, period, data_json, created_by) VALUES ($1,$2,$3,$4,$5,$6)', [id, req.body.employeeId || '', req.body.employeeName || '', req.body.period || '', req.body, req.user.id]);
+  await audit(req.user, 'create_payslip', 'payslip', id, req.body);
+  res.json({ ok:true, id });
 });
-
-app.get("/api/admin/audit-log", requireAuth, requireRole("admin", "owner", "auditor"), async (req, res) => {
-  const r = await query("SELECT * FROM audit_log ORDER BY created_at DESC LIMIT 200");
-  res.json({ ok: true, count: r.rows.length, auditLog: r.rows });
-});
-
-app.use((req, res) => {
-  res.status(404).json({ ok: false, error: "Not found", path: req.path });
+app.get('/api/mobile/payslip/:employeeId', auth, async (req, res) => {
+  const r = await query('SELECT * FROM payslips WHERE employee_id=$1 ORDER BY created_at DESC LIMIT 20', [req.params.employeeId]);
+  res.json({ ok:true, count:r.rows.length, payslips:r.rows });
 });
 
 initDb()
-  .then(() => {
-    app.listen(PORT, () => console.log(`Pengedag login backend on port ${PORT}`));
-  })
-  .catch((err) => {
-    console.error("Kunne ikke starte database:", err);
+  .then(() => app.listen(PORT, () => console.log(`Pengedag backend ${VERSION} on port ${PORT}`)))
+  .catch(err => {
+    console.error('Kunne ikke starte database:', err);
     process.exit(1);
   });
