@@ -1,6 +1,6 @@
 {
   "name": "pengedag-backend-login-adgang",
-  "version": "1.6.5",
+  "version": "1.6.6",
   "description": "Pengedag Backend PostgreSQL Login Access MigrationSafe",
   "main": "server.js",
   "scripts": {

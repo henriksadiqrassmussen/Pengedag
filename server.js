@@ -11,7 +11,7 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
 
-const VERSION = '1.6.5-immutable-audit-log';
+const VERSION = '1.6.6-audit-hash-repair';
 const PORT = process.env.PORT || 8080;
 const JWT_SECRET = process.env.JWT_SECRET || 'DEV_ONLY_CHANGE_ME_PENGEDAG';
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -77,32 +77,65 @@ async function auditTriggerExists() {
 async function backfillAuditHashes() {
   const exists = await tableExists('audit_log');
   if (!exists) return;
-  if (await auditTriggerExists()) {
-    console.log('Audit log trigger findes allerede - springer backfill over');
-    return;
-  }
+
+  // v1.6.6: Reparer altid hash-kaeden foer immutable trigger aktiveres.
+  // Hvis triggeren allerede findes fra v1.6.5, fjernes den midlertidigt,
+  // hash-kaeden genberegnes sikkert, og triggeren oprettes igen bagefter.
+  await query(`DROP TRIGGER IF EXISTS trg_audit_log_no_update_delete ON audit_log`);
+
   const r = await query(`SELECT * FROM audit_log ORDER BY created_at ASC, id ASC`);
   let prevHash = 'GENESIS';
   let seq = 1;
+
   for (const row of r.rows) {
-    const next = {
+    const repaired = {
       ...row,
-      sequence_number: row.sequence_number && Number(row.sequence_number) > 0 ? Number(row.sequence_number) : seq,
-      prev_hash: row.prev_hash || prevHash,
-      actor_role: row.actor_role || '',
-      details_json: row.details_json || {},
+      sequence_number: seq,
+      prev_hash: prevHash,
+      actor_user_id: row.actor_user_id || '',
+      actor_email: row.actor_email || '',
+      actor_role: row.actor_role || 'legacy',
+      action: row.action || '',
+      target_type: row.target_type || row.entity_type || '',
+      target_id: row.target_id || row.entity_id || '',
+      details_json: row.details_json || row.payload || {},
       created_at: row.created_at || new Date()
     };
-    next.row_hash = row.row_hash || buildAuditHash(next);
+
+    repaired.row_hash = buildAuditHash(repaired);
+
     await query(`
       UPDATE audit_log
-      SET sequence_number=$2, prev_hash=$3, row_hash=$4, actor_role=COALESCE(NULLIF(actor_role,''), $5)
+      SET sequence_number=$2,
+          prev_hash=$3,
+          row_hash=$4,
+          actor_user_id=$5,
+          actor_email=$6,
+          actor_role=$7,
+          action=$8,
+          target_type=$9,
+          target_id=$10,
+          details_json=$11
       WHERE id=$1
-    `, [row.id, next.sequence_number, next.prev_hash, next.row_hash, next.actor_role || 'legacy']);
-    prevHash = next.row_hash;
-    seq = Number(next.sequence_number) + 1;
+    `, [
+      row.id,
+      repaired.sequence_number,
+      repaired.prev_hash,
+      repaired.row_hash,
+      repaired.actor_user_id,
+      repaired.actor_email,
+      repaired.actor_role,
+      repaired.action,
+      repaired.target_type,
+      repaired.target_id,
+      repaired.details_json
+    ]);
+
+    prevHash = repaired.row_hash;
+    seq += 1;
   }
-  console.log('Audit log backfill OK: ' + r.rows.length + ' raekker');
+
+  console.log('Audit log hash repair OK: ' + r.rows.length + ' raekker');
 }
 
 async function installImmutableAuditTrigger() {
