@@ -131,6 +131,29 @@ async function initDb() {
       details_json JSONB NOT NULL DEFAULT '{}'::jsonb
     );
   `);
+
+  // v1.6.2 MIGRATION FIX:
+  // Existing Railway PostgreSQL databases from v1.6.0 already have tables.
+  // CREATE TABLE IF NOT EXISTS does NOT add new columns to old tables.
+  // Therefore we add missing columns safely before creating indexes or using them.
+  await query(`ALTER TABLE time_entries ADD COLUMN IF NOT EXISTS user_id TEXT DEFAULT '';`);
+  await query(`ALTER TABLE time_entries ADD COLUMN IF NOT EXISTS email TEXT DEFAULT '';`);
+  await query(`ALTER TABLE time_entries ADD COLUMN IF NOT EXISTS customer_id TEXT DEFAULT '';`);
+  await query(`ALTER TABLE time_entries ADD COLUMN IF NOT EXISTS customer_name TEXT DEFAULT '';`);
+  await query(`ALTER TABLE time_entries ADD COLUMN IF NOT EXISTS approved_by TEXT DEFAULT '';`);
+  await query(`ALTER TABLE time_entries ADD COLUMN IF NOT EXISTS approved_at TIMESTAMPTZ;`);
+  await query(`ALTER TABLE time_entries ADD COLUMN IF NOT EXISTS rejected_by TEXT DEFAULT '';`);
+  await query(`ALTER TABLE time_entries ADD COLUMN IF NOT EXISTS rejected_at TIMESTAMPTZ;`);
+  await query(`ALTER TABLE time_entries ADD COLUMN IF NOT EXISTS calculation_json JSONB NOT NULL DEFAULT '{}'::jsonb;`);
+
+  await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS employee_id TEXT;`);
+  await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE;`);
+
+  await query(`CREATE INDEX IF NOT EXISTS idx_time_entries_user_id ON time_entries(user_id);`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_time_entries_employee_id ON time_entries(employee_id);`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_time_entries_status ON time_entries(status);`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_audit_log_actor_user_id ON audit_log(actor_user_id);`);
+
 }
 
 function createToken(user) {
@@ -227,13 +250,13 @@ app.get("/", async (req, res) => {
   } catch (_) {
     database = "disconnected";
   }
-  res.json({ ok: true, app: "Pengedag Backend Login", version: "1.6.1-login-adgangsstyring", database });
+  res.json({ ok: true, app: "Pengedag Backend Login", version: "1.6.2-login-migrationfix", database });
 });
 
 app.get("/health", async (req, res) => {
   try {
     await query("SELECT 1");
-    res.json({ ok: true, app: "Pengedag Backend Login", version: "1.6.1-login-adgangsstyring", database: "postgresql" });
+    res.json({ ok: true, app: "Pengedag Backend Login", version: "1.6.2-login-migrationfix", database: "postgresql" });
   } catch (err) {
     res.status(500).json({ ok: false, app: "Pengedag Backend Login", database: "disconnected", error: err.message });
   }
@@ -242,7 +265,7 @@ app.get("/health", async (req, res) => {
 app.get("/api/mobile/routes", (req, res) => {
   res.json({
     ok: true,
-    version: "1.6.1-login-adgangsstyring",
+    version: "1.6.2-login-migrationfix",
     auth: "Bearer token required on protected routes",
     routes: [
       "POST /api/auth/bootstrap-admin",
@@ -339,9 +362,9 @@ app.post(["/api/mobile/time-entry", "/api/mobile/time-entries", "/api/mobile/tim
   const id = makeId("mob");
   const calc = await buildCalculation(employeeId, start, end, pauseMinutes);
   await query(
-    `INSERT INTO time_entries (id, created_at, updated_at, employee_id, employee_name, email, customer_id, customer_name, work_date, start_time, end_time, pause_minutes, note, status, calculation_json)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'Afventer',$14)`,
-    [id, nowIso(), nowIso(), employeeId, employeeName, body.email || req.user.email || "", body.customerId || "", body.customerName || "", date, start, end, pauseMinutes, body.note || "", JSON.stringify(calc)]
+    `INSERT INTO time_entries (id, created_at, updated_at, user_id, employee_id, employee_name, email, customer_id, customer_name, work_date, start_time, end_time, pause_minutes, note, status, calculation_json)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'Afventer',$15)`,
+    [id, nowIso(), nowIso(), req.user.id, employeeId, employeeName, body.email || req.user.email || "", body.customerId || "", body.customerName || "", date, start, end, pauseMinutes, body.note || "", JSON.stringify(calc)]
   );
   await audit("create_time_entry", req.user.id, "time_entry", id, { employeeId, date, start, end });
   const entry = (await query("SELECT * FROM time_entries WHERE id=$1", [id])).rows[0];
@@ -353,6 +376,7 @@ function normalizeEntry(row) {
     id: row.id,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+    userId: row.user_id || "",
     employeeId: row.employee_id,
     employeeName: row.employee_name,
     email: row.email,

@@ -1,6 +1,6 @@
 {
   "name": "pengedag-backend-login-adgang",
-  "version": "1.6.1",
+  "version": "1.6.2",
   "description": "Pengedag backend med PostgreSQL, login og rollebaseret adgangsstyring",
   "main": "server.js",
   "scripts": {
