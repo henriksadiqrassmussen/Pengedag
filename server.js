@@ -11,7 +11,7 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '15mb' }));
 
-const VERSION = '1.6.7-bilag-opbevaring';
+const VERSION = '1.6.8-bilag-audit-log-fix';
 const PORT = process.env.PORT || 8080;
 const JWT_SECRET = process.env.JWT_SECRET || 'DEV_ONLY_CHANGE_ME_PENGEDAG';
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -365,7 +365,28 @@ async function audit(actor, action, targetType, targetId, details = {}) {
     const latest = await query(`SELECT sequence_number, row_hash FROM audit_log ORDER BY sequence_number DESC, created_at DESC LIMIT 1`);
     const lastSeq = latest.rows.length ? Number(latest.rows[0].sequence_number || 0) : 0;
     const prevHash = latest.rows.length ? (latest.rows[0].row_hash || 'GENESIS') : 'GENESIS';
-    const id = makeId('audit');
+
+    // v1.6.8 fix:
+    // Nogle gamle Pengedag-databaser har audit_log.id som INTEGER/SERIAL,
+    // mens nyere versioner opretter id som TEXT. Hvis vi altid bruger
+    // makeId('audit'), fejler INSERT lydloest paa gamle databaser.
+    // Derfor vaelger vi id-type dynamisk, saa alle nye handlinger igen
+    // kommer med i den immutable audit-log.
+    const idTypeResult = await query(`
+      SELECT data_type
+      FROM information_schema.columns
+      WHERE table_name='audit_log' AND column_name='id'
+      LIMIT 1
+    `);
+    const idType = idTypeResult.rows[0]?.data_type || 'text';
+    let id;
+    if (['integer', 'bigint', 'smallint', 'numeric'].includes(idType)) {
+      const nextId = await query(`SELECT COALESCE(MAX(id), 0) + 1 AS next_id FROM audit_log`);
+      id = Number(nextId.rows[0]?.next_id || 1);
+    } else {
+      id = makeId('audit');
+    }
+
     const createdAt = new Date();
     const row = {
       id,
@@ -613,7 +634,7 @@ app.post('/api/bilag/upload', auth, async (req, res) => {
     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
     [id, req.user.id, req.user.email, req.user.role, filename, mimeType, buffer.length, hash, 'postgres_bytea', linkedType, linkedId, buffer]
   );
-  await audit(req.user, 'upload_attachment', 'attachment', id, { filename, mimeType, fileSize: buffer.length, sha256: hash, linkedType, linkedId });
+  await audit(req.user, 'CREATE_BILAG', 'bilag', id, { filename, mimeType, fileSize: buffer.length, sha256: hash, linkedType, linkedId, storageKind: 'postgres_bytea' });
   res.json({ ok: true, attachment: { id, filename, mimeType, fileSize: buffer.length, sha256: hash, linkedType, linkedId, storageKind: 'postgres_bytea' } });
 });
 
@@ -656,7 +677,7 @@ app.get('/api/bilag/:id/download', auth, async (req, res) => {
   if (!r.rows.length) return res.status(404).json({ ok: false, error: 'Bilag ikke fundet' });
   const x = r.rows[0];
   if (!(await canAccessAttachment(req.user, x))) return res.status(403).json({ ok: false, error: 'Ingen adgang til bilag' });
-  await audit(req.user, 'download_attachment', 'attachment', x.id, { filename: x.original_filename, linkedType: x.linked_type, linkedId: x.linked_id });
+  await audit(req.user, 'DOWNLOAD_BILAG', 'bilag', x.id, { filename: x.original_filename, linkedType: x.linked_type, linkedId: x.linked_id });
   res.setHeader('Content-Type', x.mime_type || 'application/octet-stream');
   res.setHeader('Content-Length', x.file_size || x.file_data.length);
   res.setHeader('Content-Disposition', `attachment; filename="${String(x.original_filename || 'bilag').replace(/"/g, '')}"`);

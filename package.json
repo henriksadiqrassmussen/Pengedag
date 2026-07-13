@@ -1,7 +1,7 @@
 {
   "name": "pengedag-backend-login-adgang",
-  "version": "1.6.7",
-  "description": "Pengedag Backend PostgreSQL Login Immutable AuditLog Bilagsopbevaring",
+  "version": "1.6.8",
+  "description": "Pengedag Backend PostgreSQL Login Immutable AuditLog Bilagsopbevaring Audit Log Fix",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
