@@ -1,356 +1,464 @@
-require('dotenv').config();
+require("dotenv").config();
 
-const express = require('express');
-const cors = require('cors');
-const { Pool } = require('pg');
+const express = require("express");
+const cors = require("cors");
+const helmet = require("helmet");
+const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
+const { Pool } = require("pg");
+const crypto = require("crypto");
 
 const app = express();
 const PORT = process.env.PORT || 8080;
+const JWT_SECRET = process.env.JWT_SECRET || "DEV_ONLY_CHANGE_ME";
 const DATABASE_URL = process.env.DATABASE_URL;
-const VERSION = '1.6.0-postgres-fast-database';
+
+app.use(helmet());
+app.use(cors({ origin: true }));
+app.use(express.json({ limit: "1mb" }));
 
 if (!DATABASE_URL) {
-  console.warn('ADVARSEL: DATABASE_URL mangler. Til Railway: tilføj PostgreSQL service og DATABASE_URL variable.');
+  console.warn("ADVARSEL: DATABASE_URL mangler. Til Railway: tilføj PostgreSQL DATABASE_URL på backend-servicen.");
+}
+if (JWT_SECRET === "DEV_ONLY_CHANGE_ME") {
+  console.warn("ADVARSEL: JWT_SECRET mangler. Til Railway: tilføj en lang hemmelig JWT_SECRET variable.");
 }
 
 const pool = new Pool({
-  connectionString: DATABASE_URL,
-  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+  connectionString: DATABASE_URL || "postgres://postgres:postgres@localhost:5432/postgres",
+  ssl: DATABASE_URL && !DATABASE_URL.includes("localhost") ? { rejectUnauthorized: false } : false
 });
 
-app.use(cors({ origin: process.env.CORS_ORIGIN || '*' }));
-app.use(express.json({ limit: '25mb' }));
-app.use(express.urlencoded({ extended: true, limit: '25mb' }));
-
-function toMinutes(time) {
-  if (!time || !/^\d{1,2}:\d{2}$/.test(String(time))) return 0;
-  const [h, m] = String(time).split(':').map(Number);
-  return h * 60 + m;
+function nowIso() {
+  return new Date().toISOString();
 }
 
-function roundTo(value, step = 0.25) {
-  const s = Number(step) || 0.25;
-  return Math.round(value / s) * s;
-}
-
-function overlap(a1, a2, b1, b2) {
-  return Math.max(0, Math.min(a2, b2) - Math.max(a1, b1));
-}
-
-function calculateNightOvertimeMinutes(start, end, input = {}) {
-  const rule = input.overtimeRule || input.rules || {};
-  const enabled = rule.nightOvertimeAuto ?? input.nightOvertimeAuto ?? 'ja';
-  if (enabled === false || enabled === 'nej' || enabled === 'false') return 0;
-  const from = toMinutes(rule.nightOvertimeFrom || input.nightOvertimeFrom || '22:00');
-  const to = toMinutes(rule.nightOvertimeTo || input.nightOvertimeTo || '06:00');
-  let mins = 0;
-  for (let d = -1; d <= 1; d++) {
-    const base = d * 24 * 60;
-    if (from <= to) {
-      mins += overlap(start, end, base + from, base + to);
-    } else {
-      mins += overlap(start, end, base + from, base + 24 * 60 + to);
-    }
-  }
-  return Math.max(0, mins);
-}
-
-function calculateEntry(input = {}) {
-  const rule = input.overtimeRule || input.rules || {};
-  const start = toMinutes(input.startTime);
-  let end = toMinutes(input.endTime);
-  if (end <= start) end += 24 * 60;
-  const pauseMinutes = Number(input.pauseMinutes || 0);
-  const rawMinutes = Math.max(0, end - start - pauseMinutes);
-  const rawHours = rawMinutes / 60;
-  const hours = Number(rawHours.toFixed(2));
-
-  const normalRate = Number(input.normalRate || input.hourlyRate || rule.normalRate || 160);
-  const overtimeRate = Number(input.overtimeRate || rule.overtimeRate || rule.standardOvertidTimeloen || 220);
-  const customerRate = Number(input.customerRate || rule.customerRate || 320);
-  const vatRate = Number(input.vatRate ?? rule.vatRate ?? 25);
-  const overtimeAfterHours = Number(input.overtimeAfterHours || rule.overtimeDailyAfter || rule.overtimeAfterHours || 7.5);
-  const roundStep = Number(input.overtimeRoundStep || rule.overtimeRound || rule.overtimeRoundStep || 0.25);
-
-  const dailyOvertime = hours > overtimeAfterHours ? hours - overtimeAfterHours : 0;
-  let nightMinutes = calculateNightOvertimeMinutes(start, end, input);
-  if (pauseMinutes > 0 && nightMinutes > 0) nightMinutes = Math.max(0, nightMinutes - pauseMinutes);
-  const nightOvertime = nightMinutes / 60;
-  const overtimeHours = Number(Math.min(hours, roundTo(Math.max(dailyOvertime, nightOvertime), roundStep)).toFixed(2));
-  const normalHours = Number(Math.max(0, hours - overtimeHours).toFixed(2));
-  const normalPay = Number((normalHours * normalRate).toFixed(2));
-  const overtimePay = Number((overtimeHours * overtimeRate).toFixed(2));
-  const employeePay = Number((normalPay + overtimePay).toFixed(2));
-  const customerTotalExVat = Number((hours * customerRate).toFixed(2));
-  const customerVat = Number((customerTotalExVat * vatRate / 100).toFixed(2));
-  const customerTotalIncVat = Number((customerTotalExVat + customerVat).toFixed(2));
-  const marginExVat = Number((customerTotalExVat - employeePay).toFixed(2));
-
-  return { hours, normalHours, overtimeHours, normalRate, overtimeRate, customerRate, vatRate, normalPay, overtimePay, employeePay, customerTotalExVat, customerVat, customerTotalIncVat, marginExVat, nightOvertimeHours: Number(nightOvertime.toFixed(2)) };
+function makeId(prefix) {
+  return `${prefix}_${Date.now()}_${crypto.randomBytes(6).toString("hex")}`;
 }
 
 async function query(sql, params = []) {
-  const client = await pool.connect();
-  try {
-    return await client.query(sql, params);
-  } finally {
-    client.release();
-  }
+  const result = await pool.query(sql, params);
+  return result;
 }
 
-async function audit(action, entityType, entityId, payload = {}) {
-  await query(
-    `INSERT INTO audit_log (action, entity_type, entity_id, payload) VALUES ($1,$2,$3,$4)`,
-    [action, entityType, entityId, JSON.stringify(payload)]
-  );
+async function audit(action, actorUserId, targetType, targetId, details = {}) {
+  try {
+    await query(
+      `INSERT INTO audit_log (id, created_at, action, actor_user_id, target_type, target_id, details_json)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      [makeId("audit"), nowIso(), action, actorUserId || "system", targetType || "system", targetId || "", JSON.stringify(details)]
+    );
+  } catch (err) {
+    console.error("Audit log fejl:", err.message);
+  }
 }
 
 async function initDb() {
   await query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id TEXT PRIMARY KEY,
+      created_at TIMESTAMPTZ NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL,
+      name TEXT NOT NULL,
+      email TEXT UNIQUE NOT NULL,
+      password_hash TEXT NOT NULL,
+      role TEXT NOT NULL CHECK (role IN ('owner','employee','auditor','admin')),
+      employee_id TEXT,
+      active BOOLEAN NOT NULL DEFAULT TRUE
+    );
+  `);
+
+  await query(`
     CREATE TABLE IF NOT EXISTS time_entries (
       id TEXT PRIMARY KEY,
-      employee_id TEXT NOT NULL DEFAULT '',
-      employee_name TEXT NOT NULL DEFAULT '',
-      email TEXT NOT NULL DEFAULT '',
-      customer_id TEXT NOT NULL DEFAULT '',
-      customer_name TEXT NOT NULL DEFAULT '',
-      job_id TEXT NOT NULL DEFAULT '',
+      created_at TIMESTAMPTZ NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL,
+      employee_id TEXT NOT NULL,
+      employee_name TEXT NOT NULL,
+      email TEXT DEFAULT '',
+      customer_id TEXT DEFAULT '',
+      customer_name TEXT DEFAULT '',
       work_date DATE NOT NULL,
-      start_time TEXT NOT NULL DEFAULT '',
-      end_time TEXT NOT NULL DEFAULT '',
+      start_time TEXT NOT NULL,
+      end_time TEXT NOT NULL,
       pause_minutes INTEGER NOT NULL DEFAULT 0,
-      note TEXT NOT NULL DEFAULT '',
+      note TEXT DEFAULT '',
       status TEXT NOT NULL DEFAULT 'Afventer',
-      calculation JSONB NOT NULL DEFAULT '{}'::jsonb,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      approved_by TEXT DEFAULT '',
       approved_at TIMESTAMPTZ,
+      rejected_by TEXT DEFAULT '',
       rejected_at TIMESTAMPTZ,
-      reject_reason TEXT NOT NULL DEFAULT ''
+      calculation_json JSONB NOT NULL DEFAULT '{}'::jsonb
     );
   `);
 
   await query(`
     CREATE TABLE IF NOT EXISTS overtime_rules (
       employee_id TEXT PRIMARY KEY,
-      rules JSONB NOT NULL DEFAULT '{}'::jsonb,
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      created_at TIMESTAMPTZ NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL,
+      normal_rate NUMERIC NOT NULL DEFAULT 160,
+      overtime_rate NUMERIC NOT NULL DEFAULT 220,
+      customer_rate NUMERIC NOT NULL DEFAULT 320,
+      overtime_after_hours NUMERIC NOT NULL DEFAULT 8,
+      night_start TEXT NOT NULL DEFAULT '22:00',
+      night_end TEXT NOT NULL DEFAULT '06:00',
+      night_overtime_enabled BOOLEAN NOT NULL DEFAULT TRUE
     );
   `);
 
   await query(`
     CREATE TABLE IF NOT EXISTS payslips (
       id TEXT PRIMARY KEY,
-      employee_id TEXT NOT NULL DEFAULT '',
-      employee_name TEXT NOT NULL DEFAULT '',
-      period_start DATE,
-      period_end DATE,
+      created_at TIMESTAMPTZ NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL,
+      employee_id TEXT NOT NULL,
+      period TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'Afventer kontrol',
-      payload JSONB NOT NULL DEFAULT '{}'::jsonb,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      data_json JSONB NOT NULL DEFAULT '{}'::jsonb
     );
   `);
 
   await query(`
     CREATE TABLE IF NOT EXISTS audit_log (
-      id BIGSERIAL PRIMARY KEY,
+      id TEXT PRIMARY KEY,
+      created_at TIMESTAMPTZ NOT NULL,
       action TEXT NOT NULL,
-      entity_type TEXT NOT NULL,
-      entity_id TEXT NOT NULL,
-      payload JSONB NOT NULL DEFAULT '{}'::jsonb,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      actor_user_id TEXT NOT NULL,
+      target_type TEXT NOT NULL,
+      target_id TEXT NOT NULL,
+      details_json JSONB NOT NULL DEFAULT '{}'::jsonb
     );
   `);
-
-  await query(`CREATE INDEX IF NOT EXISTS idx_time_entries_status ON time_entries(status);`);
-  await query(`CREATE INDEX IF NOT EXISTS idx_time_entries_employee_id ON time_entries(employee_id);`);
-  await query(`CREATE INDEX IF NOT EXISTS idx_time_entries_work_date ON time_entries(work_date);`);
 }
 
-function normalizeEntry(body = {}) {
-  const now = new Date().toISOString();
-  const entry = {
-    id: body.id || `mob_${Date.now()}_${Math.random().toString(16).slice(2)}`,
-    employeeId: body.employeeId || body.medarbejderId || '',
-    employeeName: body.employeeName || body.name || body.navn || '',
-    email: body.email || '',
-    customerId: body.customerId || '',
-    customerName: body.customerName || '',
-    jobId: body.jobId || '',
-    date: body.date || new Date().toISOString().slice(0, 10),
-    startTime: body.startTime || body.start || '',
-    endTime: body.endTime || body.end || '',
-    pauseMinutes: Number(body.pauseMinutes || body.pause || 0),
-    note: body.note || '',
-    status: body.status && body.status !== 'Lokal' ? body.status : 'Afventer',
-    createdAt: body.createdAt || now,
-    updatedAt: now
+function createToken(user) {
+  return jwt.sign(
+    {
+      sub: user.id,
+      email: user.email,
+      role: user.role,
+      name: user.name,
+      employeeId: user.employee_id || ""
+    },
+    JWT_SECRET,
+    { expiresIn: "12h" }
+  );
+}
+
+async function requireAuth(req, res, next) {
+  try {
+    const header = req.headers.authorization || "";
+    const token = header.startsWith("Bearer ") ? header.slice(7) : "";
+    if (!token) return res.status(401).json({ ok: false, error: "Mangler login token" });
+    const payload = jwt.verify(token, JWT_SECRET);
+    const result = await query("SELECT * FROM users WHERE id=$1 AND active=true", [payload.sub]);
+    if (!result.rows.length) return res.status(401).json({ ok: false, error: "Bruger findes ikke eller er deaktiveret" });
+    req.user = result.rows[0];
+    next();
+  } catch (err) {
+    return res.status(401).json({ ok: false, error: "Ugyldigt eller udløbet login" });
+  }
+}
+
+function requireRole(...roles) {
+  return (req, res, next) => {
+    if (!req.user) return res.status(401).json({ ok: false, error: "Login kræves" });
+    if (!roles.includes(req.user.role)) {
+      return res.status(403).json({ ok: false, error: "Ingen adgang", requiredRoles: roles, yourRole: req.user.role });
+    }
+    next();
   };
-  entry.calculation = calculateEntry({ ...body, ...entry });
-  return entry;
 }
 
-function dbRowToEntry(row) {
+function toPublicUser(row) {
   return {
     id: row.id,
+    name: row.name,
+    email: row.email,
+    role: row.role,
+    employeeId: row.employee_id || "",
+    active: row.active,
+    createdAt: row.created_at
+  };
+}
+
+function calcHours(start, end, pauseMinutes) {
+  const [sh, sm] = String(start).split(":").map(Number);
+  const [eh, em] = String(end).split(":").map(Number);
+  let startM = sh * 60 + sm;
+  let endM = eh * 60 + em;
+  if (endM < startM) endM += 24 * 60;
+  const worked = Math.max(0, endM - startM - (Number(pauseMinutes) || 0));
+  return Math.round((worked / 60) * 100) / 100;
+}
+
+async function getRule(employeeId) {
+  const r = await query("SELECT * FROM overtime_rules WHERE employee_id=$1", [employeeId]);
+  if (r.rows.length) return r.rows[0];
+  return {
+    normal_rate: 160,
+    overtime_rate: 220,
+    customer_rate: 320,
+    overtime_after_hours: 8,
+    night_overtime_enabled: true
+  };
+}
+
+async function buildCalculation(employeeId, start, end, pauseMinutes) {
+  const rule = await getRule(employeeId);
+  const hours = calcHours(start, end, pauseMinutes);
+  const overtimeHours = Math.max(0, hours - Number(rule.overtime_after_hours || 8));
+  const normalHours = Math.max(0, hours - overtimeHours);
+  const employeePay = Math.round((normalHours * Number(rule.normal_rate || 160) + overtimeHours * Number(rule.overtime_rate || 220)) * 100) / 100;
+  const customerTotalExVat = Math.round(hours * Number(rule.customer_rate || 320) * 100) / 100;
+  const customerVat = Math.round(customerTotalExVat * 0.25 * 100) / 100;
+  const customerTotalIncVat = Math.round((customerTotalExVat + customerVat) * 100) / 100;
+  const marginExVat = Math.round((customerTotalExVat - employeePay) * 100) / 100;
+  return { hours, normalHours, overtimeHours, employeePay, customerTotalExVat, customerVat, customerTotalIncVat, marginExVat };
+}
+
+app.get("/", async (req, res) => {
+  let database = "unknown";
+  try {
+    await query("SELECT 1");
+    database = "postgresql";
+  } catch (_) {
+    database = "disconnected";
+  }
+  res.json({ ok: true, app: "Pengedag Backend Login", version: "1.6.1-login-adgangsstyring", database });
+});
+
+app.get("/health", async (req, res) => {
+  try {
+    await query("SELECT 1");
+    res.json({ ok: true, app: "Pengedag Backend Login", version: "1.6.1-login-adgangsstyring", database: "postgresql" });
+  } catch (err) {
+    res.status(500).json({ ok: false, app: "Pengedag Backend Login", database: "disconnected", error: err.message });
+  }
+});
+
+app.get("/api/mobile/routes", (req, res) => {
+  res.json({
+    ok: true,
+    version: "1.6.1-login-adgangsstyring",
+    auth: "Bearer token required on protected routes",
+    routes: [
+      "POST /api/auth/bootstrap-admin",
+      "POST /api/auth/login",
+      "GET /api/auth/me",
+      "POST /api/auth/users",
+      "GET /api/auth/users",
+      "GET /api/mobile/time-entries",
+      "GET /api/mobile/times",
+      "POST /api/mobile/time-entry",
+      "POST /api/mobile/time-entries/:id/approve",
+      "POST /api/mobile/time-entries/:id/reject",
+      "GET /api/admin/audit-log"
+    ]
+  });
+});
+
+app.post("/api/auth/bootstrap-admin", async (req, res) => {
+  const existing = await query("SELECT COUNT(*)::int AS count FROM users WHERE role='admin'");
+  if (existing.rows[0].count > 0) {
+    return res.status(403).json({ ok: false, error: "Admin findes allerede. Brug login." });
+  }
+  const { name, email, password } = req.body || {};
+  if (!name || !email || !password || password.length < 8) {
+    return res.status(400).json({ ok: false, error: "name, email og password på mindst 8 tegn kræves" });
+  }
+  const id = makeId("usr");
+  const hash = await bcrypt.hash(password, 12);
+  await query(
+    `INSERT INTO users (id, created_at, updated_at, name, email, password_hash, role, employee_id, active)
+     VALUES ($1,$2,$3,$4,$5,$6,'admin','',true)`,
+    [id, nowIso(), nowIso(), name, String(email).toLowerCase(), hash]
+  );
+  await audit("bootstrap_admin", id, "user", id, { email });
+  const user = (await query("SELECT * FROM users WHERE id=$1", [id])).rows[0];
+  res.json({ ok: true, user: toPublicUser(user), token: createToken(user) });
+});
+
+app.post("/api/auth/login", async (req, res) => {
+  const { email, password } = req.body || {};
+  if (!email || !password) return res.status(400).json({ ok: false, error: "email og password kræves" });
+  const result = await query("SELECT * FROM users WHERE email=$1 AND active=true", [String(email).toLowerCase()]);
+  if (!result.rows.length) return res.status(401).json({ ok: false, error: "Forkert login" });
+  const user = result.rows[0];
+  const ok = await bcrypt.compare(password, user.password_hash);
+  if (!ok) return res.status(401).json({ ok: false, error: "Forkert login" });
+  await audit("login", user.id, "user", user.id, { email: user.email });
+  res.json({ ok: true, user: toPublicUser(user), token: createToken(user) });
+});
+
+app.get("/api/auth/me", requireAuth, (req, res) => {
+  res.json({ ok: true, user: toPublicUser(req.user) });
+});
+
+app.post("/api/auth/users", requireAuth, requireRole("admin", "owner"), async (req, res) => {
+  const { name, email, password, role, employeeId } = req.body || {};
+  const allowed = ["owner", "employee", "auditor", "admin"];
+  if (!name || !email || !password || !allowed.includes(role)) {
+    return res.status(400).json({ ok: false, error: "name, email, password og gyldig role kræves" });
+  }
+  if (password.length < 8) return res.status(400).json({ ok: false, error: "password skal være mindst 8 tegn" });
+  const id = makeId("usr");
+  const hash = await bcrypt.hash(password, 12);
+  try {
+    await query(
+      `INSERT INTO users (id, created_at, updated_at, name, email, password_hash, role, employee_id, active)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,true)`,
+      [id, nowIso(), nowIso(), name, String(email).toLowerCase(), hash, role, employeeId || ""]
+    );
+    await audit("create_user", req.user.id, "user", id, { email, role });
+    const user = (await query("SELECT * FROM users WHERE id=$1", [id])).rows[0];
+    res.json({ ok: true, user: toPublicUser(user) });
+  } catch (err) {
+    res.status(400).json({ ok: false, error: "Kunne ikke oprette bruger", details: err.message });
+  }
+});
+
+app.get("/api/auth/users", requireAuth, requireRole("admin", "owner", "auditor"), async (req, res) => {
+  const result = await query("SELECT * FROM users ORDER BY created_at DESC");
+  res.json({ ok: true, count: result.rows.length, users: result.rows.map(toPublicUser) });
+});
+
+app.post(["/api/mobile/time-entry", "/api/mobile/time-entries", "/api/mobile/times", "/api/mobile/timesheets", "/api/mobile/entries"], requireAuth, requireRole("employee", "owner", "admin"), async (req, res) => {
+  const body = req.body || {};
+  const employeeId = req.user.role === "employee" ? (req.user.employee_id || body.employeeId || req.user.id) : (body.employeeId || body.employee_id || "");
+  const employeeName = req.user.role === "employee" ? req.user.name : (body.employeeName || body.employee_name || "");
+  const date = body.date || body.workDate || body.work_date;
+  const start = body.start || body.startTime || body.start_time;
+  const end = body.end || body.endTime || body.end_time;
+  const pauseMinutes = Number(body.pauseMinutes || body.pause_minutes || 0);
+  if (!employeeId || !employeeName || !date || !start || !end) {
+    return res.status(400).json({ ok: false, error: "employeeId, employeeName, date, start og end kræves" });
+  }
+  const id = makeId("mob");
+  const calc = await buildCalculation(employeeId, start, end, pauseMinutes);
+  await query(
+    `INSERT INTO time_entries (id, created_at, updated_at, employee_id, employee_name, email, customer_id, customer_name, work_date, start_time, end_time, pause_minutes, note, status, calculation_json)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'Afventer',$14)`,
+    [id, nowIso(), nowIso(), employeeId, employeeName, body.email || req.user.email || "", body.customerId || "", body.customerName || "", date, start, end, pauseMinutes, body.note || "", JSON.stringify(calc)]
+  );
+  await audit("create_time_entry", req.user.id, "time_entry", id, { employeeId, date, start, end });
+  const entry = (await query("SELECT * FROM time_entries WHERE id=$1", [id])).rows[0];
+  res.json({ ok: true, entry: normalizeEntry(entry) });
+});
+
+function normalizeEntry(row) {
+  return {
+    id: row.id,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
     employeeId: row.employee_id,
     employeeName: row.employee_name,
     email: row.email,
     customerId: row.customer_id,
     customerName: row.customer_name,
-    jobId: row.job_id,
-    date: row.work_date instanceof Date ? row.work_date.toISOString().slice(0,10) : String(row.work_date).slice(0,10),
-    startTime: row.start_time,
-    endTime: row.end_time,
+    date: row.work_date,
+    start: row.start_time,
+    end: row.end_time,
     pauseMinutes: row.pause_minutes,
     note: row.note,
     status: row.status,
-    calculation: row.calculation || {},
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
+    approvedBy: row.approved_by,
     approvedAt: row.approved_at,
+    rejectedBy: row.rejected_by,
     rejectedAt: row.rejected_at,
-    rejectReason: row.reject_reason
+    calculation: row.calculation_json || {}
   };
 }
 
-app.get('/', (req, res) => {
-  res.json({ ok: true, app: 'Pengedag Backend PostgreSQL', version: VERSION, database: DATABASE_URL ? 'postgresql' : 'missing DATABASE_URL' });
-});
-
-app.get('/health', async (req, res) => {
-  try {
-    const r = await query('SELECT NOW() AS now');
-    res.json({ ok: true, status: 'healthy', version: VERSION, database: 'connected', time: r.rows[0].now });
-  } catch (err) {
-    res.status(500).json({ ok: false, status: 'database_error', version: VERSION, error: err.message });
+app.get(["/api/mobile/time-entries", "/api/mobile/times", "/api/mobile/timesheets", "/api/mobile/entries"], requireAuth, requireRole("owner", "admin", "auditor", "employee"), async (req, res) => {
+  let result;
+  if (req.user.role === "employee") {
+    result = await query("SELECT * FROM time_entries WHERE employee_id=$1 ORDER BY created_at DESC", [req.user.employee_id || req.user.id]);
+  } else {
+    result = await query("SELECT * FROM time_entries ORDER BY created_at DESC");
   }
+  res.json({ ok: true, count: result.rows.length, entries: result.rows.map(normalizeEntry) });
 });
 
-app.get('/api/mobile/routes', (req, res) => {
-  res.json({ ok: true, version: VERSION, routes: [
-    'GET /api/mobile/time-entries', 'GET /api/mobile/times', 'GET /api/mobile/timesheets', 'GET /api/mobile/entries',
-    'POST /api/mobile/time-entry', 'POST /api/mobile/time-entries', 'POST /api/mobile/times', 'POST /api/mobile/timesheets', 'POST /api/mobile/entries',
-    'POST /api/mobile/time-entries/:id/approve', 'POST /api/mobile/time-entries/:id/reject',
-    'GET /api/mobile/overtime-rules/:employeeId', 'POST /api/mobile/overtime-rules',
-    'POST /api/mobile/payslip', 'GET /api/mobile/payslip/:employeeId',
-    'GET /api/admin/audit-log'
-  ]});
+app.post("/api/mobile/time-entries/:id/approve", requireAuth, requireRole("owner", "admin"), async (req, res) => {
+  const id = req.params.id;
+  const result = await query(
+    `UPDATE time_entries SET status='Godkendt', approved_by=$1, approved_at=$2, updated_at=$2 WHERE id=$3 RETURNING *`,
+    [req.user.id, nowIso(), id]
+  );
+  if (!result.rows.length) return res.status(404).json({ ok: false, error: "Timeseddel ikke fundet" });
+  await audit("approve_time_entry", req.user.id, "time_entry", id, {});
+  res.json({ ok: true, entry: normalizeEntry(result.rows[0]) });
 });
 
-async function listEntries(req, res) {
-  const limit = Math.min(Number(req.query.limit || 100), 500);
-  const status = req.query.status;
-  const employeeId = req.query.employeeId;
-  const params = [];
-  let where = [];
-  if (status) { params.push(status); where.push(`status = $${params.length}`); }
-  if (employeeId) { params.push(employeeId); where.push(`employee_id = $${params.length}`); }
-  params.push(limit);
-  const sql = `SELECT * FROM time_entries ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY created_at DESC LIMIT $${params.length}`;
-  const r = await query(sql, params);
-  res.json({ ok: true, count: r.rows.length, entries: r.rows.map(dbRowToEntry) });
-}
-
-['/api/mobile/time-entries', '/api/mobile/times', '/api/mobile/timesheets', '/api/mobile/entries'].forEach(route => {
-  app.get(route, (req, res) => listEntries(req, res).catch(err => res.status(500).json({ ok: false, error: err.message })));
+app.post("/api/mobile/time-entries/:id/reject", requireAuth, requireRole("owner", "admin"), async (req, res) => {
+  const id = req.params.id;
+  const result = await query(
+    `UPDATE time_entries SET status='Afvist', rejected_by=$1, rejected_at=$2, updated_at=$2 WHERE id=$3 RETURNING *`,
+    [req.user.id, nowIso(), id]
+  );
+  if (!result.rows.length) return res.status(404).json({ ok: false, error: "Timeseddel ikke fundet" });
+  await audit("reject_time_entry", req.user.id, "time_entry", id, { reason: req.body?.reason || "" });
+  res.json({ ok: true, entry: normalizeEntry(result.rows[0]) });
 });
 
-async function addEntry(req, res) {
-  const entry = normalizeEntry(req.body || {});
-  const c = entry.calculation;
-  await query(`
-    INSERT INTO time_entries (id, employee_id, employee_name, email, customer_id, customer_name, job_id, work_date, start_time, end_time, pause_minutes, note, status, calculation, created_at, updated_at)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
-    ON CONFLICT (id) DO UPDATE SET
-      employee_id=EXCLUDED.employee_id, employee_name=EXCLUDED.employee_name, email=EXCLUDED.email, customer_id=EXCLUDED.customer_id, customer_name=EXCLUDED.customer_name,
-      job_id=EXCLUDED.job_id, work_date=EXCLUDED.work_date, start_time=EXCLUDED.start_time, end_time=EXCLUDED.end_time, pause_minutes=EXCLUDED.pause_minutes,
-      note=EXCLUDED.note, status=EXCLUDED.status, calculation=EXCLUDED.calculation, updated_at=NOW()
-  `, [entry.id, entry.employeeId, entry.employeeName, entry.email, entry.customerId, entry.customerName, entry.jobId, entry.date, entry.startTime, entry.endTime, entry.pauseMinutes, entry.note, entry.status, JSON.stringify(c), entry.createdAt, entry.updatedAt]);
-  await audit('CREATE_TIME_ENTRY', 'time_entry', entry.id, entry);
-  res.json({ ok: true, entry });
-}
-
-['/api/mobile/time-entry', '/api/mobile/time-entries', '/api/mobile/times', '/api/mobile/timesheets', '/api/mobile/entries'].forEach(route => {
-  app.post(route, (req, res) => addEntry(req, res).catch(err => res.status(500).json({ ok: false, error: err.message })));
+app.get("/api/mobile/overtime-rules/:employeeId", requireAuth, requireRole("owner", "admin", "auditor", "employee"), async (req, res) => {
+  if (req.user.role === "employee" && req.params.employeeId !== (req.user.employee_id || req.user.id)) {
+    return res.status(403).json({ ok: false, error: "Medarbejder må kun se egne regler" });
+  }
+  const rule = await getRule(req.params.employeeId);
+  res.json({ ok: true, rule });
 });
 
-app.post('/api/mobile/time-entries/:id/approve', async (req, res) => {
-  try {
-    const id = req.params.id;
-    const r = await query(`UPDATE time_entries SET status='Godkendt', approved_at=NOW(), updated_at=NOW(), rejected_at=NULL, reject_reason='' WHERE id=$1 RETURNING *`, [id]);
-    if (!r.rows[0]) return res.status(404).json({ ok: false, error: 'Time entry not found' });
-    await audit('APPROVE_TIME_ENTRY', 'time_entry', id, { by: req.body?.by || 'owner_app' });
-    res.json({ ok: true, entry: dbRowToEntry(r.rows[0]) });
-  } catch (err) { res.status(500).json({ ok: false, error: err.message }); }
+app.post("/api/mobile/overtime-rules", requireAuth, requireRole("owner", "admin"), async (req, res) => {
+  const b = req.body || {};
+  if (!b.employeeId) return res.status(400).json({ ok: false, error: "employeeId kræves" });
+  await query(
+    `INSERT INTO overtime_rules (employee_id, created_at, updated_at, normal_rate, overtime_rate, customer_rate, overtime_after_hours, night_start, night_end, night_overtime_enabled)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+     ON CONFLICT (employee_id) DO UPDATE SET updated_at=$3, normal_rate=$4, overtime_rate=$5, customer_rate=$6, overtime_after_hours=$7, night_start=$8, night_end=$9, night_overtime_enabled=$10`,
+    [b.employeeId, nowIso(), nowIso(), b.normalRate || 160, b.overtimeRate || 220, b.customerRate || 320, b.overtimeAfterHours || 8, b.nightStart || "22:00", b.nightEnd || "06:00", b.nightOvertimeEnabled !== false]
+  );
+  await audit("set_overtime_rule", req.user.id, "employee", b.employeeId, b);
+  res.json({ ok: true });
 });
 
-app.post('/api/mobile/time-entries/:id/reject', async (req, res) => {
-  try {
-    const id = req.params.id;
-    const reason = req.body?.reason || req.body?.note || '';
-    const r = await query(`UPDATE time_entries SET status='Afvist', rejected_at=NOW(), updated_at=NOW(), reject_reason=$2 WHERE id=$1 RETURNING *`, [id, reason]);
-    if (!r.rows[0]) return res.status(404).json({ ok: false, error: 'Time entry not found' });
-    await audit('REJECT_TIME_ENTRY', 'time_entry', id, { reason, by: req.body?.by || 'owner_app' });
-    res.json({ ok: true, entry: dbRowToEntry(r.rows[0]) });
-  } catch (err) { res.status(500).json({ ok: false, error: err.message }); }
+app.post("/api/mobile/payslip", requireAuth, requireRole("owner", "admin"), async (req, res) => {
+  const b = req.body || {};
+  const id = makeId("pay");
+  if (!b.employeeId || !b.period) return res.status(400).json({ ok: false, error: "employeeId og period kræves" });
+  await query(
+    `INSERT INTO payslips (id, created_at, updated_at, employee_id, period, status, data_json) VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+    [id, nowIso(), nowIso(), b.employeeId, b.period, b.status || "Afventer kontrol", JSON.stringify(b.data || b)]
+  );
+  await audit("create_payslip", req.user.id, "payslip", id, { employeeId: b.employeeId, period: b.period });
+  res.json({ ok: true, id });
 });
 
-app.get('/api/mobile/overtime-rules/:employeeId', async (req, res) => {
-  try {
-    const r = await query('SELECT * FROM overtime_rules WHERE employee_id=$1', [req.params.employeeId]);
-    res.json({ ok: true, employeeId: req.params.employeeId, rules: r.rows[0]?.rules || {} });
-  } catch (err) { res.status(500).json({ ok: false, error: err.message }); }
+app.get("/api/mobile/payslip/:employeeId", requireAuth, requireRole("owner", "admin", "auditor", "employee"), async (req, res) => {
+  if (req.user.role === "employee" && req.params.employeeId !== (req.user.employee_id || req.user.id)) {
+    return res.status(403).json({ ok: false, error: "Medarbejder må kun se egne lønsedler" });
+  }
+  const r = await query("SELECT * FROM payslips WHERE employee_id=$1 ORDER BY created_at DESC", [req.params.employeeId]);
+  res.json({ ok: true, count: r.rows.length, payslips: r.rows });
 });
 
-app.post('/api/mobile/overtime-rules', async (req, res) => {
-  try {
-    const employeeId = req.body.employeeId || req.body.medarbejderId || '';
-    if (!employeeId) return res.status(400).json({ ok: false, error: 'employeeId mangler' });
-    const rules = req.body.rules || req.body;
-    await query(`INSERT INTO overtime_rules (employee_id, rules, updated_at) VALUES ($1,$2,NOW()) ON CONFLICT (employee_id) DO UPDATE SET rules=EXCLUDED.rules, updated_at=NOW()`, [employeeId, JSON.stringify(rules)]);
-    await audit('UPSERT_OVERTIME_RULES', 'overtime_rules', employeeId, rules);
-    res.json({ ok: true, employeeId, rules });
-  } catch (err) { res.status(500).json({ ok: false, error: err.message }); }
-});
-
-app.post('/api/mobile/payslip', async (req, res) => {
-  try {
-    const id = req.body.id || `pay_${Date.now()}_${Math.random().toString(16).slice(2)}`;
-    const employeeId = req.body.employeeId || req.body.medarbejderId || '';
-    const employeeName = req.body.employeeName || req.body.name || req.body.navn || '';
-    const status = req.body.status || 'Afventer kontrol';
-    await query(`INSERT INTO payslips (id, employee_id, employee_name, period_start, period_end, status, payload, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,NOW()) ON CONFLICT (id) DO UPDATE SET status=EXCLUDED.status, payload=EXCLUDED.payload, updated_at=NOW()`, [id, employeeId, employeeName, req.body.periodStart || null, req.body.periodEnd || null, status, JSON.stringify(req.body)]);
-    await audit('UPSERT_PAYSLIP', 'payslip', id, req.body);
-    res.json({ ok: true, payslip: { id, employeeId, employeeName, status, payload: req.body } });
-  } catch (err) { res.status(500).json({ ok: false, error: err.message }); }
-});
-
-app.get('/api/mobile/payslip/:employeeId', async (req, res) => {
-  try {
-    const r = await query(`SELECT * FROM payslips WHERE employee_id=$1 ORDER BY created_at DESC LIMIT 25`, [req.params.employeeId]);
-    res.json({ ok: true, count: r.rows.length, payslips: r.rows });
-  } catch (err) { res.status(500).json({ ok: false, error: err.message }); }
-});
-
-app.get('/api/admin/audit-log', async (req, res) => {
-  try {
-    const limit = Math.min(Number(req.query.limit || 100), 500);
-    const r = await query(`SELECT * FROM audit_log ORDER BY created_at DESC LIMIT $1`, [limit]);
-    res.json({ ok: true, count: r.rows.length, auditLog: r.rows });
-  } catch (err) { res.status(500).json({ ok: false, error: err.message }); }
+app.get("/api/admin/audit-log", requireAuth, requireRole("admin", "owner", "auditor"), async (req, res) => {
+  const r = await query("SELECT * FROM audit_log ORDER BY created_at DESC LIMIT 200");
+  res.json({ ok: true, count: r.rows.length, auditLog: r.rows });
 });
 
 app.use((req, res) => {
-  res.status(404).json({ ok: false, error: 'Route not found', path: req.path });
+  res.status(404).json({ ok: false, error: "Not found", path: req.path });
 });
 
 initDb()
   .then(() => {
-    app.listen(PORT, () => console.log(`Pengedag PostgreSQL backend ${VERSION} on port ${PORT}`));
+    app.listen(PORT, () => console.log(`Pengedag login backend on port ${PORT}`));
   })
-  .catch(err => {
-    console.error('Kunne ikke starte database:', err);
+  .catch((err) => {
+    console.error("Kunne ikke starte database:", err);
     process.exit(1);
   });
