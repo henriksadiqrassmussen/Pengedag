@@ -11,7 +11,7 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '15mb' }));
 
-const VERSION = '1.6.9-bilag-audit-strict-fix';
+const VERSION = '1.6.10-audit-legacy-columns-fix';
 const PORT = process.env.PORT || 8080;
 const JWT_SECRET = process.env.JWT_SECRET || 'DEV_ONLY_CHANGE_ME_PENGEDAG';
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -280,6 +280,11 @@ async function initDb() {
   await addColumnIfMissing('audit_log', 'target_type', "TEXT DEFAULT ''");
   await addColumnIfMissing('audit_log', 'target_id', "TEXT DEFAULT ''");
   await addColumnIfMissing('audit_log', 'details_json', "JSONB DEFAULT '{}'::jsonb");
+  // v1.6.10: Gamle Pengedag-databaser kan have disse NOT NULL legacy-kolonner.
+  // Vi sikrer dem, og audit()-funktionen skriver til baade nye og gamle kolonnenavne.
+  await addColumnIfMissing('audit_log', 'entity_type', "TEXT DEFAULT ''");
+  await addColumnIfMissing('audit_log', 'entity_id', "TEXT DEFAULT ''");
+  await addColumnIfMissing('audit_log', 'payload', "JSONB DEFAULT '{}'::jsonb");
   await addColumnIfMissing('audit_log', 'created_at', 'TIMESTAMPTZ NOT NULL DEFAULT NOW()');
 
   await addColumnIfMissing('users', 'employee_id', "TEXT DEFAULT ''");
@@ -391,24 +396,57 @@ async function audit(actor, action, targetType, targetId, details = {}) {
   };
   row.row_hash = buildAuditHash(row);
 
-  // v1.6.9: Gamle databaser har ofte audit_log.id som SERIAL/INTEGER.
-  // Her lader vi PostgreSQL selv lave id'et, så INSERT ikke fejler på id-type eller sekvens.
-  // Hvis id er TEXT, bruger vi vores eget audit-id.
-  if (numericId || columnDefault.includes('nextval')) {
-    await query(
-      `INSERT INTO audit_log (actor_user_id, actor_email, actor_role, sequence_number, prev_hash, row_hash, action, target_type, target_id, details_json, created_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
-      [row.actor_user_id, row.actor_email, row.actor_role, row.sequence_number, row.prev_hash, row.row_hash, action, row.target_type, row.target_id, row.details_json, createdAt]
-    );
-  } else {
-    await query(
-      `INSERT INTO audit_log (id, actor_user_id, actor_email, actor_role, sequence_number, prev_hash, row_hash, action, target_type, target_id, details_json, created_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
-      [row.id, row.actor_user_id, row.actor_email, row.actor_role, row.sequence_number, row.prev_hash, row.row_hash, action, row.target_type, row.target_id, row.details_json, createdAt]
-    );
-  }
-}
+  // v1.6.10: Robust INSERT til baade nye og gamle audit_log-skemaer.
+  // Nogle gamle databaser har NOT NULL kolonnerne entity_type/entity_id/payload.
+  // Derfor bygger vi INSERT dynamisk ud fra de kolonner, databasen faktisk har.
+  const colsResult = await query(`
+    SELECT column_name
+    FROM information_schema.columns
+    WHERE table_name='audit_log'
+  `);
+  const existingCols = new Set(colsResult.rows.map(r => r.column_name));
 
+  const data = {
+    actor_user_id: row.actor_user_id,
+    actor_email: row.actor_email,
+    actor_role: row.actor_role,
+    sequence_number: row.sequence_number,
+    prev_hash: row.prev_hash,
+    row_hash: row.row_hash,
+    action: row.action,
+    target_type: row.target_type,
+    target_id: row.target_id,
+    details_json: row.details_json,
+    // Legacy-kolonner:
+    entity_type: row.target_type,
+    entity_id: row.target_id,
+    payload: row.details_json,
+    created_at: createdAt
+  };
+
+  if (!numericId && !columnDefault.includes('nextval') && existingCols.has('id')) {
+    data.id = row.id;
+  }
+
+  const preferredOrder = [
+    'id',
+    'actor_user_id', 'actor_email', 'actor_role',
+    'sequence_number', 'prev_hash', 'row_hash',
+    'action',
+    'target_type', 'target_id', 'details_json',
+    'entity_type', 'entity_id', 'payload',
+    'created_at'
+  ];
+
+  const insertCols = preferredOrder.filter(c => existingCols.has(c) && Object.prototype.hasOwnProperty.call(data, c));
+  const values = insertCols.map(c => data[c]);
+  const placeholders = insertCols.map((_, i) => `$${i + 1}`);
+
+  await query(
+    `INSERT INTO audit_log (${insertCols.join(', ')}) VALUES (${placeholders.join(', ')})`,
+    values
+  );
+}
 function signToken(user) {
   return jwt.sign({ id: user.id, email: user.email, role: user.role, employeeId: user.employee_id || '' }, JWT_SECRET, { expiresIn: '12h' });
 }
