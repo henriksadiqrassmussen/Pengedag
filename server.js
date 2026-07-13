@@ -55,6 +55,7 @@ async function audit(action, actorUserId, targetType, targetId, details = {}) {
 }
 
 async function initDb() {
+  // Step 1: Create tables if they do not exist
   await query(`
     CREATE TABLE IF NOT EXISTS users (
       id TEXT PRIMARY KEY,
@@ -132,10 +133,11 @@ async function initDb() {
     );
   `);
 
-  // v1.6.2 MIGRATION FIX:
-  // Existing Railway PostgreSQL databases from v1.6.0 already have tables.
-  // CREATE TABLE IF NOT EXISTS does NOT add new columns to old tables.
-  // Therefore we add missing columns safely before creating indexes or using them.
+  // Step 2: Add missing columns to existing tables (safe migrations)
+  // This handles v1.6.0 databases that have old table structures
+  console.log("Running v1.6.2 database migrations...");
+  
+  // Migrate time_entries table
   await query(`ALTER TABLE time_entries ADD COLUMN IF NOT EXISTS user_id TEXT DEFAULT '';`);
   await query(`ALTER TABLE time_entries ADD COLUMN IF NOT EXISTS email TEXT DEFAULT '';`);
   await query(`ALTER TABLE time_entries ADD COLUMN IF NOT EXISTS customer_id TEXT DEFAULT '';`);
@@ -146,14 +148,29 @@ async function initDb() {
   await query(`ALTER TABLE time_entries ADD COLUMN IF NOT EXISTS rejected_at TIMESTAMPTZ;`);
   await query(`ALTER TABLE time_entries ADD COLUMN IF NOT EXISTS calculation_json JSONB NOT NULL DEFAULT '{}'::jsonb;`);
 
+  // Migrate users table
   await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS employee_id TEXT;`);
   await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE;`);
 
+  // CRITICAL: Migrate audit_log table - add missing columns BEFORE creating indexes
+  // The old v1.6.0 audit_log table may have different structure, so we ensure all columns exist
+  await query(`ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS id TEXT;`);
+  await query(`ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();`);
+  await query(`ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS action TEXT NOT NULL DEFAULT '';`);
+  await query(`ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS actor_user_id TEXT DEFAULT '';`);
+  await query(`ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS target_type TEXT DEFAULT '';`);
+  await query(`ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS target_id TEXT DEFAULT '';`);
+  await query(`ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS details_json JSONB NOT NULL DEFAULT '{}'::jsonb;`);
+
+  // Step 3: Create indexes only AFTER all columns exist
+  console.log("Creating database indexes...");
   await query(`CREATE INDEX IF NOT EXISTS idx_time_entries_user_id ON time_entries(user_id);`);
   await query(`CREATE INDEX IF NOT EXISTS idx_time_entries_employee_id ON time_entries(employee_id);`);
   await query(`CREATE INDEX IF NOT EXISTS idx_time_entries_status ON time_entries(status);`);
   await query(`CREATE INDEX IF NOT EXISTS idx_audit_log_actor_user_id ON audit_log(actor_user_id);`);
-
+  await query(`CREATE INDEX IF NOT EXISTS idx_audit_log_created_at ON audit_log(created_at);`);
+  
+  console.log("Database migrations completed successfully");
 }
 
 function createToken(user) {
@@ -256,9 +273,9 @@ app.get("/", async (req, res) => {
 app.get("/health", async (req, res) => {
   try {
     await query("SELECT 1");
-    res.json({ ok: true, app: "Pengedag Backend Login", version: "1.6.2-login-migrationfix", database: "postgresql" });
+    res.json({ ok: true, status: "healthy", version: "1.6.2-login-migrationfix", database: "connected" });
   } catch (err) {
-    res.status(500).json({ ok: false, app: "Pengedag Backend Login", database: "disconnected", error: err.message });
+    res.status(500).json({ ok: false, status: "database_error", version: "1.6.2-login-migrationfix", database: "disconnected", error: err.message });
   }
 });
 
@@ -486,3 +503,4 @@ initDb()
     console.error("Kunne ikke starte database:", err);
     process.exit(1);
   });
+
