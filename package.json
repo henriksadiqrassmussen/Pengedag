@@ -1,11 +1,9 @@
 {
   "name": "pengedag-backend-login-adgang",
-  "version": "1.6.15",
-  "description": "Pengedag Backend PostgreSQL Produktionsklar Sikkerhed",
+  "version": "1.6.17",
+  "description": "Pengedag Backend Skift Adgangskode",
   "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
-  },
+  "scripts": { "start": "node server.js" },
   "dependencies": {
     "bcryptjs": "^2.4.3",
     "cors": "^2.8.5",
@@ -14,7 +12,5 @@
     "jsonwebtoken": "^9.0.2",
     "pg": "^8.12.0"
   },
-  "engines": {
-    "node": ">=18"
-  }
+  "engines": { "node": ">=18" }
 }

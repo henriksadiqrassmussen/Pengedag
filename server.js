@@ -70,7 +70,7 @@ app.use(cors({
 }));
 app.use(express.json({ limit: JSON_LIMIT }));
 
-const VERSION = '1.6.15-produktionsklar-sikkerhed';
+const VERSION = '1.6.17-skift-adgangskode';
 const PORT = process.env.PORT || 8080;
 const JWT_SECRET = process.env.JWT_SECRET || 'DEV_ONLY_CHANGE_ME_PENGEDAG';
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -566,7 +566,7 @@ app.get('/health', async (req, res) => {
 });
 
 app.get('/api/mobile/routes', (req, res) => res.json({ ok: true, version: VERSION, routes: [
-  'GET /health', 'POST /api/auth/bootstrap-admin', 'POST /api/auth/login', 'GET /api/auth/me', 'POST /api/auth/users',
+  'GET /health', 'POST /api/auth/bootstrap-admin', 'POST /api/auth/login', 'GET /api/auth/me', 'POST /api/auth/change-password', 'POST /api/auth/users',
   'POST /api/mobile/time-entry', 'GET /api/mobile/times', 'POST /api/mobile/time-entries/:id/approve', 'POST /api/mobile/time-entries/:id/reject', 'POST /api/bilag/upload', 'GET /api/bilag', 'GET /api/bilag/:id', 'GET /api/bilag/:id/download', 'GET /api/admin/backup/export', 'POST /api/admin/backup/restore', 'GET /api/admin/revisor/export', 'GET /api/admin/saft/preview', 'GET /api/legal/gdpr', 'GET /api/legal/dpa', 'GET /api/gdpr/my-data', 'GET /api/admin/gdpr/export-user/:userId', 'POST /api/admin/gdpr/record-request', 'GET /api/admin/audit-log', 'GET /api/admin/audit-log/verify', 'GET /api/admin/security/status', 'POST /api/admin/security/record-check'
 ]}));
 
@@ -623,6 +623,40 @@ app.post('/api/auth/login', makeRateLimiter('login', LOGIN_RATE_LIMIT_MAX, RATE_
 });
 
 app.get('/api/auth/me', auth, (req, res) => res.json({ ok: true, user: req.user }));
+
+app.post('/api/auth/change-password', auth, makeRateLimiter('change-password', 8, RATE_LIMIT_WINDOW_MS), async (req, res) => {
+  const { currentPassword, newPassword, confirmPassword } = req.body || {};
+  if (!currentPassword || !newPassword || !confirmPassword) {
+    return res.status(400).json({ ok: false, error: 'Nuværende adgangskode, ny adgangskode og gentagelse kræves' });
+  }
+  if (String(newPassword) !== String(confirmPassword)) {
+    return res.status(400).json({ ok: false, error: 'Ny adgangskode og gentagelse er ikke ens' });
+  }
+  if (String(newPassword).length < 12) {
+    return res.status(400).json({ ok: false, error: 'Ny adgangskode skal være mindst 12 tegn' });
+  }
+  if (String(newPassword) === String(currentPassword)) {
+    return res.status(400).json({ ok: false, error: 'Ny adgangskode må ikke være den samme som den gamle' });
+  }
+  const weak = ['password', 'adgangskode', '123456', 'pengedag'];
+  const lowered = String(newPassword).toLowerCase();
+  if (weak.some(w => lowered === w || lowered.includes(w + '123'))) {
+    return res.status(400).json({ ok: false, error: 'Ny adgangskode er for svag' });
+  }
+  const r = await query('SELECT * FROM users WHERE id=$1', [req.user.id]);
+  if (!r.rows.length) return res.status(401).json({ ok: false, error: 'Bruger findes ikke' });
+  const user = r.rows[0];
+  const ok = await bcrypt.compare(String(currentPassword), user.password_hash);
+  if (!ok) {
+    await audit(req.user, 'CHANGE_PASSWORD_FAILED', 'user', req.user.id, { reason: 'wrong_current_password', ip: clientIp(req), requestId: req.requestId });
+    return res.status(401).json({ ok: false, error: 'Nuværende adgangskode er forkert' });
+  }
+  const newHash = await bcrypt.hash(String(newPassword), 12);
+  await query('UPDATE users SET password_hash=$1 WHERE id=$2', [newHash, req.user.id]);
+  await audit(req.user, 'CHANGE_PASSWORD', 'user', req.user.id, { email: req.user.email, role: req.user.role, ip: clientIp(req), requestId: req.requestId });
+  res.json({ ok: true, message: 'Adgangskode er ændret. Log ind igen med den nye adgangskode.', requestId: req.requestId });
+});
+
 
 app.post('/api/auth/users', auth, requireRole('admin', 'owner'), async (req, res) => {
   const { email, password, role, employeeId, name } = req.body || {};
