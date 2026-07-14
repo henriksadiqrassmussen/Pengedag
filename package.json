@@ -1,6 +1,6 @@
 {
   "name": "pengedag-backend-login-adgang",
-  "version": "1.6.18f",
+  "version": "1.6.18g",
   "description": "Pengedag Backend Time Entry Safe Fix",
   "main": "server.js",
   "scripts": {

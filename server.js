@@ -98,10 +98,10 @@ function isStrongSecret(value) {
 
 app.use(securityHeaders);
 app.use(makeRateLimiter('global', RATE_LIMIT_MAX, RATE_LIMIT_WINDOW_MS));
-// v1.6.18f: work_date legacy column fix for safe time-entry route.
+// v1.6.18g: payslip month/date + work_date + hours fix.
 app.use(express.json({ limit: JSON_LIMIT }));
 
-const VERSION = '1.6.18f-work-date-fix';
+const VERSION = '1.6.18g-payslip-month-hours-fix';
 const PORT = process.env.PORT || 8080;
 const JWT_SECRET = process.env.JWT_SECRET || 'DEV_ONLY_CHANGE_ME_PENGEDAG';
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -1509,36 +1509,93 @@ app.post('/api/mobile/overtime-rules', auth, requireRole('admin','owner'), async
   res.json({ ok:true, employeeId });
 });
 app.post('/api/mobile/payslip', auth, requireRole('admin','owner'), async (req, res) => {
-  // v1.6.18b: Safe payslip route. Never let a DB/audit mismatch crash Railway.
-  // Uses existing schema if present and returns clear JSON errors instead of 502.
+  // v1.6.18g: robust payslip route.
+  // Accepts period = YYYY-MM, period = YYYY-MM-DD, or periodStart/periodEnd.
+  // Looks at both legacy work_date and date columns, and reads hours from calculation_json.
   try {
-    const employeeId = req.body.employeeId || req.body.employee_id || '';
-    if (!employeeId) return res.status(400).json({ ok:false, error:'employeeId mangler' });
+    const employeeId = String(req.body.employeeId || req.body.employee_id || '').trim();
+    if (!employeeId) return res.status(400).json({ ok:false, error:'employeeId mangler', requestId:req.requestId });
 
-    const employeeName = req.body.employeeName || req.body.employee_name || '';
-    const periodStart = req.body.periodStart || req.body.period_start || '';
-    const periodEnd = req.body.periodEnd || req.body.period_end || '';
-    const period = req.body.period || (periodStart || periodEnd ? `${periodStart} - ${periodEnd}` : '');
+    const employeeName = String(req.body.employeeName || req.body.employee_name || '').trim();
+    let periodStart = String(req.body.periodStart || req.body.period_start || '').trim();
+    let periodEnd = String(req.body.periodEnd || req.body.period_end || '').trim();
+    let period = String(req.body.period || '').trim();
 
-    // Find approved entries for the employee in the requested period when possible.
+    function lastDayOfMonth(yyyyMM) {
+      const [y, m] = yyyyMM.split('-').map(Number);
+      const d = new Date(Date.UTC(y, m, 0));
+      return String(d.getUTCDate()).padStart(2, '0');
+    }
+
+    // Hvis frontend sender 2026-07, brug hele måneden.
+    if (!periodStart && !periodEnd && /^\d{4}-\d{2}$/.test(period)) {
+      periodStart = `${period}-01`;
+      periodEnd = `${period}-${lastDayOfMonth(period)}`;
+    }
+
+    // Hvis frontend ved fejl sender 2026-07-13, tolker vi det som måneden 2026-07.
+    if (!periodStart && !periodEnd && /^\d{4}-\d{2}-\d{2}$/.test(period)) {
+      const ym = period.slice(0, 7);
+      periodStart = `${ym}-01`;
+      periodEnd = `${ym}-${lastDayOfMonth(ym)}`;
+      period = ym;
+    }
+
+    // Hvis kun start er sendt som YYYY-MM, brug måneden.
+    if (periodStart && /^\d{4}-\d{2}$/.test(periodStart) && !periodEnd) {
+      period = periodStart;
+      periodEnd = `${periodStart}-${lastDayOfMonth(periodStart)}`;
+      periodStart = `${periodStart}-01`;
+    }
+
+    if (!period && periodStart && periodEnd) period = `${periodStart} - ${periodEnd}`;
+    if (!period) period = new Date().toISOString().slice(0, 7);
+
     let entries = [];
     try {
-      let q = 'SELECT * FROM time_entries WHERE employee_id=$1';
+      let q = `SELECT * FROM time_entries WHERE employee_id=$1`;
       const params = [employeeId];
       if (periodStart && periodEnd) {
-        q += ' AND date >= $2 AND date <= $3';
+        // Legacy-safe: nogle rækker bruger work_date, andre date. Begge er TEXT i vores migrations.
+        q += ` AND COALESCE(NULLIF(work_date,''), NULLIF(date,'')) >= $2 AND COALESCE(NULLIF(work_date,''), NULLIF(date,'')) <= $3`;
         params.push(periodStart, periodEnd);
       }
-      q += ' ORDER BY date ASC, start_time ASC, start ASC';
+      q += ` ORDER BY COALESCE(NULLIF(work_date,''), NULLIF(date,'')) ASC, start_time ASC, id ASC`;
       const er = await query(q, params);
       entries = er.rows || [];
     } catch (e) {
-      // Some older schemas use different date/start names. Payslip should still be creatable.
       console.warn('Payslip entries lookup warning:', e.message);
+      return res.status(500).json({ ok:false, error:'Kunne ikke hente timer til lønseddel', details:e.message, requestId:req.requestId });
     }
 
-    const approvedEntries = entries.filter(x => String(x.status || '').toLowerCase().includes('godkend') || String(x.status || '').toLowerCase().includes('approved'));
-    const totalHours = approvedEntries.reduce((sum, x) => sum + Number(x.hours || x.total_hours || x.calculated_hours || 0), 0);
+    const approvedEntries = entries.filter(x => {
+      const st = String(x.status || '').toLowerCase();
+      return st.includes('godkend') || st.includes('approved');
+    });
+
+    function hoursFromEntry(x) {
+      // 1) Direkte kolonner hvis de findes.
+      const direct = Number(x.hours || x.total_hours || x.calculated_hours || 0);
+      if (direct > 0) return direct;
+
+      // 2) calculation_json kan være object eller string.
+      try {
+        const cj = typeof x.calculation_json === 'string' ? JSON.parse(x.calculation_json || '{}') : (x.calculation_json || {});
+        const h = Number(cj.hours || cj.normalHours || cj.totalHours || 0);
+        if (h > 0) return h;
+      } catch (_) {}
+
+      // 3) Fallback: beregn fra start/slut/pause.
+      try {
+        const start = String(x.start_time || x.start || '');
+        const end = String(x.end_time || x.end || '');
+        const pause = Number(x.pause_minutes || x.pauseMinutes || 0) || 0;
+        if (start && end) return calcHours(start, end, pause);
+      } catch (_) {}
+      return 0;
+    }
+
+    const totalHours = approvedEntries.reduce((sum, x) => sum + hoursFromEntry(x), 0);
 
     const id = makeId('pay');
     const dataJson = {
@@ -1552,10 +1609,18 @@ app.post('/api/mobile/payslip', auth, requireRole('admin','owner'), async (req, 
       generatedBy: req.user.email || req.user.id,
       entriesFound: entries.length,
       approvedEntries: approvedEntries.length,
-      totalHours
+      totalHours,
+      entries: approvedEntries.map(x => ({
+        id: x.id,
+        date: x.work_date || x.date,
+        start: x.start_time,
+        end: x.end_time,
+        pauseMinutes: x.pause_minutes,
+        status: x.status,
+        hours: hoursFromEntry(x)
+      }))
     };
 
-    // Insert dynamically so old/new payslips schemas both work.
     const colsResult = await query(`
       SELECT column_name
       FROM information_schema.columns
@@ -1577,7 +1642,7 @@ app.post('/api/mobile/payslip', auth, requireRole('admin','owner'), async (req, 
     const placeholders = insertCols.map((_, i) => `$${i+1}`);
 
     if (!insertCols.includes('id')) {
-      return res.status(500).json({ ok:false, error:'Payslips table mangler id-kolonne' });
+      return res.status(500).json({ ok:false, error:'Payslips table mangler id-kolonne', requestId:req.requestId });
     }
 
     await query(`INSERT INTO payslips (${insertCols.join(', ')}) VALUES (${placeholders.join(', ')})`, values);
@@ -1586,13 +1651,13 @@ app.post('/api/mobile/payslip', auth, requireRole('admin','owner'), async (req, 
       await audit(req.user, 'CREATE_PAYSLIP', 'payslip', id, { employeeId, period, periodStart, periodEnd, entriesFound: entries.length, approvedEntries: approvedEntries.length, totalHours });
     } catch (auditErr) {
       console.error('Payslip audit failed:', auditErr.message);
-      return res.status(500).json({ ok:false, error:'Lønseddel blev gemt, men audit-log fejlede', auditError:auditErr.message, payslipId:id });
+      return res.status(500).json({ ok:false, error:'Lønseddel blev gemt, men audit-log fejlede', auditError:auditErr.message, payslipId:id, requestId:req.requestId });
     }
 
-    return res.json({ ok:true, id, payslip: { id, employeeId, employeeName, period, totalHours, entriesFound: entries.length, approvedEntries: approvedEntries.length } });
+    return res.json({ ok:true, id, payslip: { id, employeeId, employeeName, period, periodStart, periodEnd, totalHours, entriesFound: entries.length, approvedEntries: approvedEntries.length } });
   } catch (e) {
     console.error('Payslip route failed:', e);
-    return res.status(500).json({ ok:false, error:'Lønseddel fejlede i backend', detail:e.message });
+    return res.status(500).json({ ok:false, error:'Lønseddel fejlede i backend', details:e.message, requestId:req.requestId });
   }
 });
 app.get('/api/mobile/payslip/:employeeId', auth, async (req, res) => {
