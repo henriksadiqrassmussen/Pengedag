@@ -11,6 +11,43 @@ const app = express();
 app.disable('x-powered-by');
 app.set('trust proxy', 1);
 
+// v1.6.18d HARD CORS FIX
+// Skal ligge foer rate-limit, auth, JSON parser og alle routes.
+function getAllowedCorsOrigins() {
+  const fromEnv = (process.env.CORS_ORIGINS || '')
+    .split(',')
+    .map(x => x.trim().replace(/^['"]|['"]$/g, ''))
+    .filter(Boolean);
+  const defaults = [
+    'https://pengedag.dk',
+    'https://www.pengedag.dk',
+    'http://pengedag.dk',
+    'http://www.pengedag.dk'
+  ];
+  return Array.from(new Set([...defaults, ...fromEnv]));
+}
+
+function hardCors(req, res, next) {
+  const origin = req.headers.origin;
+  const allowed = getAllowedCorsOrigins();
+  if (origin && allowed.includes(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Credentials', 'false');
+  }
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type, Accept, X-Requested-With, X-Request-Id');
+  res.setHeader('Access-Control-Expose-Headers', 'X-Request-Id, X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset');
+  res.setHeader('Access-Control-Max-Age', '86400');
+
+  if (req.method === 'OPTIONS') {
+    return res.status(204).end();
+  }
+  return next();
+}
+
+app.use(hardCors);
+
 const JSON_LIMIT = process.env.JSON_LIMIT || '10mb';
 const RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS || 15 * 60 * 1000);
 const RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_MAX || 300);
@@ -61,23 +98,10 @@ function isStrongSecret(value) {
 
 app.use(securityHeaders);
 app.use(makeRateLimiter('global', RATE_LIMIT_MAX, RATE_LIMIT_WINDOW_MS));
-const corsOptions = {
-  origin: (origin, cb) => {
-    const allowed = (process.env.CORS_ORIGINS || '').split(',').map(x => x.trim()).filter(Boolean);
-    if (!origin || allowed.length === 0 || allowed.includes(origin)) return cb(null, true);
-    return cb(new Error('CORS origin ikke tilladt'));
-  },
-  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'X-Requested-With'],
-  exposedHeaders: ['X-Request-Id', 'X-RateLimit-Limit', 'X-RateLimit-Remaining', 'X-RateLimit-Reset'],
-  optionsSuccessStatus: 204,
-  maxAge: 86400
-};
-app.use(cors(corsOptions));
-app.options('*', cors(corsOptions));
+// v1.6.18d: CORS haandteres manuelt helt oeverst via hardCors.
 app.use(express.json({ limit: JSON_LIMIT }));
 
-const VERSION = '1.6.18c-cors-preflight-fix';
+const VERSION = '1.6.18d-cors-hard-fix';
 const PORT = process.env.PORT || 8080;
 const JWT_SECRET = process.env.JWT_SECRET || 'DEV_ONLY_CHANGE_ME_PENGEDAG';
 const DATABASE_URL = process.env.DATABASE_URL;
