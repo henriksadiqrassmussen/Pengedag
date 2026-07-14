@@ -101,7 +101,7 @@ app.use(makeRateLimiter('global', RATE_LIMIT_MAX, RATE_LIMIT_WINDOW_MS));
 // v1.6.18g: payslip month/date + work_date + hours fix.
 app.use(express.json({ limit: JSON_LIMIT }));
 
-const VERSION = '1.6.18h-admin-password-reset';
+const VERSION = '1.6.18i-payslip-date-safe-fix';
 const PORT = process.env.PORT || 8080;
 const JWT_SECRET = process.env.JWT_SECRET || 'DEV_ONLY_CHANGE_ME_PENGEDAG';
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -690,44 +690,6 @@ app.post('/api/auth/change-password', auth, makeRateLimiter('change-password', 8
   res.json({ ok: true, message: 'Adgangskode er ændret. Log ind igen med den nye adgangskode.', requestId: req.requestId });
 });
 
-
-
-app.post('/api/admin/reset-admin-password', async (req, res) => {
-  // Sikker nøgle kræves fra Railway Variables.
-  // Brug kun til kontrolleret recovery hvis admin-koden er glemt.
-  try {
-    const resetKey = String(req.headers['x-reset-key'] || '');
-    const expected = String(process.env.ADMIN_RESET_KEY || '');
-    if (!expected || resetKey !== expected) {
-      return res.status(403).json({ ok:false, error:'Forkert reset-nøgle' });
-    }
-
-    const email = String(req.body?.email || '').toLowerCase().trim();
-    const newPassword = String(req.body?.newPassword || '');
-    if (!email || !newPassword || newPassword.length < 12) {
-      return res.status(400).json({ ok:false, error:'Email og ny adgangskode på mindst 12 tegn kræves' });
-    }
-
-    const userResult = await query('SELECT * FROM users WHERE email=$1', [email]);
-    if (!userResult.rows.length) {
-      return res.status(404).json({ ok:false, error:'Bruger findes ikke' });
-    }
-
-    const user = userResult.rows[0];
-    const hash = await bcrypt.hash(newPassword, 12);
-    await query('UPDATE users SET password_hash=$1 WHERE id=$2', [hash, user.id]);
-
-    await audit({ id:user.id, email:user.email, role:user.role }, 'ADMIN_PASSWORD_RESET', 'user', user.id, {
-      email,
-      performedAt: new Date().toISOString()
-    });
-
-    res.json({ ok:true, message:'Adgangskode nulstillet. Login igen med den nye kode.' });
-  } catch (e) {
-    console.error('ADMIN_RESET_FAILED', e);
-    res.status(500).json({ ok:false, error:'Reset fejlede', details:e.message });
-  }
-});
 
 app.post('/api/auth/users', auth, requireRole('admin', 'owner'), async (req, res) => {
   const { email, password, role, employeeId, name } = req.body || {};
@@ -1594,11 +1556,12 @@ app.post('/api/mobile/payslip', auth, requireRole('admin','owner'), async (req, 
       let q = `SELECT * FROM time_entries WHERE employee_id=$1`;
       const params = [employeeId];
       if (periodStart && periodEnd) {
-        // Legacy-safe: nogle rækker bruger work_date, andre date. Begge er TEXT i vores migrations.
-        q += ` AND COALESCE(NULLIF(work_date,''), NULLIF(date,'')) >= $2 AND COALESCE(NULLIF(work_date,''), NULLIF(date,'')) <= $3`;
+        // v1.6.18i: ignorer gamle rækker uden dato i lønseddel-søgning.
+        q += ` AND NULLIF(COALESCE(NULLIF(work_date::text,''), NULLIF(date::text,'')), '')::date >= $2::date
+               AND NULLIF(COALESCE(NULLIF(work_date::text,''), NULLIF(date::text,'')), '')::date <= $3::date`;
         params.push(periodStart, periodEnd);
       }
-      q += ` ORDER BY COALESCE(NULLIF(work_date,''), NULLIF(date,'')) ASC, start_time ASC, id ASC`;
+      q += ` ORDER BY NULLIF(COALESCE(NULLIF(work_date::text,''), NULLIF(date::text,'')), '')::date ASC NULLS LAST, start_time ASC, id ASC`;
       const er = await query(q, params);
       entries = er.rows || [];
     } catch (e) {
