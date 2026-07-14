@@ -1,7 +1,7 @@
 {
   "name": "pengedag-backend-login-adgang",
-  "version": "1.7.0",
-  "description": "Pengedag Full Server L\u00f8nprofil",
+  "version": "1.6.18i",
+  "description": "Pengedag Backend Time Entry Safe Fix",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
