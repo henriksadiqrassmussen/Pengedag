@@ -98,10 +98,10 @@ function isStrongSecret(value) {
 
 app.use(securityHeaders);
 app.use(makeRateLimiter('global', RATE_LIMIT_MAX, RATE_LIMIT_WINDOW_MS));
-// v1.6.18e: CORS hard fix + safe time-entry route.
+// v1.6.18f: work_date legacy column fix for safe time-entry route.
 app.use(express.json({ limit: JSON_LIMIT }));
 
-const VERSION = '1.6.18e-time-entry-safe-fix';
+const VERSION = '1.6.18f-work-date-fix';
 const PORT = process.env.PORT || 8080;
 const JWT_SECRET = process.env.JWT_SECRET || 'DEV_ONLY_CHANGE_ME_PENGEDAG';
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -349,6 +349,8 @@ async function initDb() {
   await addColumnIfMissing('time_entries', 'customer_id', "TEXT DEFAULT ''");
   await addColumnIfMissing('time_entries', 'customer_name', "TEXT DEFAULT ''");
   await addColumnIfMissing('time_entries', 'date', "TEXT DEFAULT ''");
+  // v1.6.18f: gamle databaser kan have NOT NULL work_date. Vi skriver til begge felter.
+  await addColumnIfMissing('time_entries', 'work_date', "TEXT DEFAULT ''");
   await addColumnIfMissing('time_entries', 'start_time', "TEXT DEFAULT ''");
   await addColumnIfMissing('time_entries', 'end_time', "TEXT DEFAULT ''");
   await addColumnIfMissing('time_entries', 'pause_minutes', "INTEGER DEFAULT 0");
@@ -727,8 +729,8 @@ app.post(['/api/mobile/time-entry','/api/mobile/time-entries','/api/mobile/times
     const hours = calcHours(start, end, pauseMinutes);
     const calc = { hours, normalHours: hours, overtimeHours: 0 };
 
-    await query(`INSERT INTO time_entries (id,user_id,employee_id,employee_name,email,customer_id,customer_name,date,start_time,end_time,pause_minutes,note,status,calculation_json)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb)`,
+    await query(`INSERT INTO time_entries (id,user_id,employee_id,employee_name,email,customer_id,customer_name,date,work_date,start_time,end_time,pause_minutes,note,status,calculation_json)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::jsonb)`,
       [
         id,
         req.user.id || '',
@@ -737,6 +739,7 @@ app.post(['/api/mobile/time-entry','/api/mobile/time-entries','/api/mobile/times
         String(body.email || req.user.email || ''),
         String(body.customerId || body.customer_id || ''),
         String(body.customerName || body.customer_name || ''),
+        date,
         date,
         start,
         end,
