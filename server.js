@@ -11,7 +11,7 @@ const app = express();
 app.disable('x-powered-by');
 app.set('trust proxy', 1);
 
-// v1.6.18d HARD CORS FIX
+// v1.6.18e TIME ENTRY SAFE FIX
 // Skal ligge foer rate-limit, auth, JSON parser og alle routes.
 function getAllowedCorsOrigins() {
   const fromEnv = (process.env.CORS_ORIGINS || '')
@@ -98,10 +98,10 @@ function isStrongSecret(value) {
 
 app.use(securityHeaders);
 app.use(makeRateLimiter('global', RATE_LIMIT_MAX, RATE_LIMIT_WINDOW_MS));
-// v1.6.18d: CORS haandteres manuelt helt oeverst via hardCors.
+// v1.6.18e: CORS hard fix + safe time-entry route.
 app.use(express.json({ limit: JSON_LIMIT }));
 
-const VERSION = '1.6.18d-cors-hard-fix';
+const VERSION = '1.6.18e-time-entry-safe-fix';
 const PORT = process.env.PORT || 8080;
 const JWT_SECRET = process.env.JWT_SECRET || 'DEV_ONLY_CHANGE_ME_PENGEDAG';
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -701,24 +701,63 @@ app.post('/api/auth/users', auth, requireRole('admin', 'owner'), async (req, res
 });
 
 app.post(['/api/mobile/time-entry','/api/mobile/time-entries','/api/mobile/times','/api/mobile/timesheets','/api/mobile/entries'], auth, async (req, res) => {
-  const body = req.body || {};
-  const id = makeId('mob');
-  const employeeId = body.employeeId || body.employee_id || req.user.employee_id || '';
-  if (req.user.role === 'employee' && req.user.employee_id && employeeId && employeeId !== req.user.employee_id) {
-    return res.status(403).json({ ok: false, error: 'Medarbejder kan kun sende egne timer' });
+  try {
+    const body = req.body || {};
+    const id = makeId('mob');
+    const employeeId = String(body.employeeId || body.employee_id || req.user.employee_id || '').trim();
+
+    if (!employeeId) {
+      return res.status(400).json({ ok: false, error: 'employeeId mangler', requestId: req.requestId });
+    }
+
+    if (req.user.role === 'employee' && req.user.employee_id && employeeId !== req.user.employee_id) {
+      return res.status(403).json({ ok: false, error: 'Medarbejder kan kun sende egne timer', requestId: req.requestId });
+    }
+
+    const employeeName = String(body.employeeName || body.employee_name || req.user.name || '').trim();
+    const date = String(body.date || '').trim();
+    const start = String(body.start || body.startTime || body.start_time || '').trim();
+    const end = String(body.end || body.endTime || body.end_time || '').trim();
+    const pauseMinutes = Number(body.pauseMinutes ?? body.pause_minutes ?? 0) || 0;
+
+    if (!date || !start || !end) {
+      return res.status(400).json({ ok: false, error: 'Dato, start og slut skal udfyldes', requestId: req.requestId });
+    }
+
+    const hours = calcHours(start, end, pauseMinutes);
+    const calc = { hours, normalHours: hours, overtimeHours: 0 };
+
+    await query(`INSERT INTO time_entries (id,user_id,employee_id,employee_name,email,customer_id,customer_name,date,start_time,end_time,pause_minutes,note,status,calculation_json)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb)`,
+      [
+        id,
+        req.user.id || '',
+        employeeId,
+        employeeName,
+        String(body.email || req.user.email || ''),
+        String(body.customerId || body.customer_id || ''),
+        String(body.customerName || body.customer_name || ''),
+        date,
+        start,
+        end,
+        pauseMinutes,
+        String(body.note || ''),
+        'Afventer',
+        JSON.stringify(calc)
+      ]
+    );
+
+    await audit(req.user, 'CREATE_TIME_ENTRY', 'time_entry', id, { employeeId, employeeName, date, start, end, pauseMinutes, hours, requestId: req.requestId });
+
+    return res.json({
+      ok: true,
+      entry: { id, employeeId, employeeName, date, start, end, pauseMinutes, note: String(body.note || ''), status: 'Afventer', calculation: calc },
+      requestId: req.requestId
+    });
+  } catch (e) {
+    console.error('TIME_ENTRY_CREATE_FAILED', { requestId: req.requestId, error: e.message, stack: e.stack });
+    return res.status(500).json({ ok: false, error: 'Opret time fejlede', details: e.message, requestId: req.requestId });
   }
-  const employeeName = body.employeeName || body.employee_name || req.user.name || '';
-  const start = body.start || body.startTime || body.start_time || '';
-  const end = body.end || body.endTime || body.end_time || '';
-  const pauseMinutes = Number(body.pauseMinutes || body.pause_minutes || 0);
-  const hours = calcHours(start, end, pauseMinutes);
-  const calc = { hours, normalHours: hours, overtimeHours: 0 };
-  await query(`INSERT INTO time_entries (id,user_id,employee_id,employee_name,email,customer_id,customer_name,date,start_time,end_time,pause_minutes,note,status,calculation_json)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
-    [id, req.user.id, employeeId, employeeName, body.email || '', body.customerId || '', body.customerName || '', body.date || '', start, end, pauseMinutes, body.note || '', 'Afventer', calc]
-  );
-  await audit(req.user, 'create_time_entry', 'time_entry', id, { employeeId, employeeName, date: body.date, hours });
-  res.json({ ok: true, entry: { id, employeeId, employeeName, date: body.date || '', start, end, pauseMinutes, note: body.note || '', status: 'Afventer', calculation: calc } });
 });
 
 app.get(['/api/mobile/times','/api/mobile/time-entries','/api/mobile/timesheets','/api/mobile/entries'], auth, async (req, res) => {

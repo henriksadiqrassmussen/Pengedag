@@ -1,7 +1,7 @@
 {
   "name": "pengedag-backend-login-adgang",
-  "version": "1.6.18d",
-  "description": "Pengedag Backend Medarbejder Dashboard",
+  "version": "1.6.18e",
+  "description": "Pengedag Backend Time Entry Safe Fix",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
