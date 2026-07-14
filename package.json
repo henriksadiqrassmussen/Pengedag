@@ -1,7 +1,7 @@
 {
   "name": "pengedag-backend-login-adgang",
-  "version": "1.6.18g",
-  "description": "Pengedag Backend Time Entry Safe Fix",
+  "version": "1.6.18h",
+  "description": "Pengedag Admin Password Reset Recovery",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
