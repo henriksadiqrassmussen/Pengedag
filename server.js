@@ -25,7 +25,7 @@ function securityHeaders(req, res, next) {
   res.setHeader('X-Frame-Options', 'DENY');
   res.setHeader('Referrer-Policy', 'no-referrer');
   res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=()');
-  res.setHeader('Cross-Origin-Resource-Policy', 'same-site');
+  res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin'); // v1.6.18c: tillad pengedag.dk -> Railway API
   if (process.env.NODE_ENV === 'production') {
     res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
   }
@@ -61,16 +61,23 @@ function isStrongSecret(value) {
 
 app.use(securityHeaders);
 app.use(makeRateLimiter('global', RATE_LIMIT_MAX, RATE_LIMIT_WINDOW_MS));
-app.use(cors({
+const corsOptions = {
   origin: (origin, cb) => {
     const allowed = (process.env.CORS_ORIGINS || '').split(',').map(x => x.trim()).filter(Boolean);
     if (!origin || allowed.length === 0 || allowed.includes(origin)) return cb(null, true);
     return cb(new Error('CORS origin ikke tilladt'));
-  }
-}));
+  },
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'X-Requested-With'],
+  exposedHeaders: ['X-Request-Id', 'X-RateLimit-Limit', 'X-RateLimit-Remaining', 'X-RateLimit-Reset'],
+  optionsSuccessStatus: 204,
+  maxAge: 86400
+};
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
 app.use(express.json({ limit: JSON_LIMIT }));
 
-const VERSION = '1.6.18b-payslip-safe-fix';
+const VERSION = '1.6.18c-cors-preflight-fix';
 const PORT = process.env.PORT || 8080;
 const JWT_SECRET = process.env.JWT_SECRET || 'DEV_ONLY_CHANGE_ME_PENGEDAG';
 const DATABASE_URL = process.env.DATABASE_URL;
