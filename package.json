@@ -1,6 +1,6 @@
 {
   "name": "pengedag-backend-login-adgang",
-  "version": "1.6.18b",
+  "version": "1.6.18c",
   "description": "Pengedag Backend Medarbejder Dashboard",
   "main": "server.js",
   "scripts": {
