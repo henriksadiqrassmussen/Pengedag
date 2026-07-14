@@ -101,7 +101,7 @@ app.use(makeRateLimiter('global', RATE_LIMIT_MAX, RATE_LIMIT_WINDOW_MS));
 // v1.6.18g: payslip month/date + work_date + hours fix.
 app.use(express.json({ limit: JSON_LIMIT }));
 
-const VERSION = '1.6.18i-payslip-date-safe-fix';
+const VERSION = '1.7.0-lonprofil-full-server';
 const PORT = process.env.PORT || 8080;
 const JWT_SECRET = process.env.JWT_SECRET || 'DEV_ONLY_CHANGE_ME_PENGEDAG';
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -1682,7 +1682,84 @@ app.use((req, res) => {
 });
 
 initDb()
-  .then(() => app.listen(PORT, () => console.log(`Pengedag backend ${VERSION} on port ${PORT}`)))
+  .then(() => 
+
+// ===============================
+// Pengedag v1.7.0 Lønprofil
+// ===============================
+async function ensureSalarySettingsTableV170() {
+  await query(`CREATE TABLE IF NOT EXISTS employee_salary_settings (
+    id TEXT PRIMARY KEY,
+    employee_id TEXT UNIQUE NOT NULL,
+    employee_name TEXT DEFAULT '',
+    employee_email TEXT DEFAULT '',
+    normal_rate NUMERIC DEFAULT 160,
+    overtime_rate NUMERIC DEFAULT 220,
+    customer_rate NUMERIC DEFAULT 320,
+    pension_percent NUMERIC DEFAULT 8,
+    employer_pension_percent NUMERIC DEFAULT 4,
+    employee_pension_percent NUMERIC DEFAULT 4,
+    am_bidrag_percent NUMERIC DEFAULT 8,
+    tax_percent NUMERIC DEFAULT 38,
+    deduction NUMERIC DEFAULT 0,
+    currency TEXT DEFAULT 'DKK',
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
+}
+
+app.get('/api/admin/employees/:employeeId/salary-settings', auth, requireRole('admin','owner','auditor'), async (req,res)=>{
+  try {
+    await ensureSalarySettingsTableV170();
+    const r = await query('SELECT * FROM employee_salary_settings WHERE employee_id=$1',[req.params.employeeId]);
+    if (!r.rows.length) return res.json({ok:true,found:false,salarySettings:{employeeId:req.params.employeeId,normalRate:160,overtimeRate:220,pensionPercent:8,taxPercent:38,currency:'DKK'}});
+    res.json({ok:true,found:true,salarySettings:r.rows[0]});
+  } catch(e){res.status(500).json({ok:false,error:e.message});}
+});
+
+app.put('/api/admin/employees/:employeeId/salary-settings', auth, requireRole('admin','owner'), async (req,res)=>{
+  try {
+    await ensureSalarySettingsTableV170();
+    const b=req.body||{};
+    const employeeId=req.params.employeeId;
+    const old=await query('SELECT * FROM employee_salary_settings WHERE employee_id=$1',[employeeId]);
+    await query(`INSERT INTO employee_salary_settings
+    (id,employee_id,employee_name,employee_email,normal_rate,overtime_rate,customer_rate,pension_percent,employer_pension_percent,employee_pension_percent,am_bidrag_percent,tax_percent,deduction,currency,updated_at)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,NOW())
+    ON CONFLICT(employee_id) DO UPDATE SET
+    employee_name=EXCLUDED.employee_name,
+    employee_email=EXCLUDED.employee_email,
+    normal_rate=EXCLUDED.normal_rate,
+    overtime_rate=EXCLUDED.overtime_rate,
+    customer_rate=EXCLUDED.customer_rate,
+    pension_percent=EXCLUDED.pension_percent,
+    employer_pension_percent=EXCLUDED.employer_pension_percent,
+    employee_pension_percent=EXCLUDED.employee_pension_percent,
+    am_bidrag_percent=EXCLUDED.am_bidrag_percent,
+    tax_percent=EXCLUDED.tax_percent,
+    deduction=EXCLUDED.deduction,
+    currency=EXCLUDED.currency,
+    updated_at=NOW()`,[
+      'sal_'+employeeId,employeeId,b.employeeName||'',b.employeeEmail||'',
+      Number(b.normalRate||160),Number(b.overtimeRate||220),Number(b.customerRate||320),
+      Number(b.pensionPercent||8),Number(b.employerPensionPercent||4),Number(b.employeePensionPercent||4),
+      Number(b.amBidragPercent||8),Number(b.taxPercent||38),Number(b.deduction||0),b.currency||'DKK'
+    ]);
+    await audit(req.user,'CHANGE_SALARY_SETTINGS','employee_salary_settings',employeeId,{old:old.rows[0]||null,new:b});
+    res.json({ok:true,message:'Lønprofil gemt'});
+  } catch(e){res.status(500).json({ok:false,error:e.message});}
+});
+
+app.get('/api/employee/my-salary-settings', auth, async (req,res)=>{
+  try {
+    await ensureSalarySettingsTableV170();
+    const employeeId=req.user.employee_id || req.user.employeeId || '';
+    const r=await query('SELECT * FROM employee_salary_settings WHERE employee_id=$1',[employeeId]);
+    res.json({ok:true,salarySettings:r.rows[0]||null});
+  } catch(e){res.status(500).json({ok:false,error:e.message});}
+});
+
+app.listen(PORT, () => console.log(`Pengedag backend ${VERSION} on port ${PORT}`)))
   .catch(err => {
     console.error('Kunne ikke starte database:', err);
     process.exit(1);
