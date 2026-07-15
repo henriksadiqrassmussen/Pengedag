@@ -1,6 +1,6 @@
 {
-  "name": "pengedag-v2-payroll-pdf-email-reports",
-  "version": "2.1.6",
+  "name": "pengedag-v2-hard-server-fix",
+  "version": "2.1.7",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

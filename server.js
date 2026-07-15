@@ -9,7 +9,8 @@ const nodemailer = require("nodemailer");
 
 const app = express();
 const PORT = process.env.PORT || 8080;
-const VERSION = "2.1.2-schema-safe-time-entry-fix";
+const VERSION = "2.1.7-hard-server-fix";
+console.log("### PENGEDAG SERVER.JS HARD FIX 2.1.7 LOADED ###");
 
 const JWT_SECRET = process.env.JWT_SECRET || "pengedag-local-secret";
 const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || "vault1973@gmail.com").toLowerCase();
@@ -56,9 +57,16 @@ function periodRange(period) {
 
 async function audit(user, action, targetType, targetId, details={}) {
   try {
+    await q("CREATE TABLE IF NOT EXISTS audit_log (id TEXT PRIMARY KEY, actor_email TEXT, action TEXT, target_type TEXT, target_id TEXT, details JSONB, created_at TIMESTAMPTZ DEFAULT NOW())");
+    await q("ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS details JSONB");
+    await q("ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS actor_email TEXT");
+    await q("ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS action TEXT");
+    await q("ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS target_type TEXT");
+    await q("ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS target_id TEXT");
+    await q("ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()");
     await q("INSERT INTO audit_log (id, actor_email, action, target_type, target_id, details) VALUES ($1,$2,$3,$4,$5,$6)",
       [uid("audit"), user?.email || "", action, targetType, targetId, details]);
-  } catch (e) { console.error("audit failed", e.message); }
+  } catch (e) { console.error("audit failed but ignored", e.message); }
 }
 
 async function ensureColumn(tableName, columnName, sqlType) {
@@ -154,6 +162,13 @@ async function ensureDb() {
     id TEXT PRIMARY KEY, actor_email TEXT, action TEXT, target_type TEXT, target_id TEXT, details JSONB,
     created_at TIMESTAMPTZ DEFAULT NOW()
   )`);
+  await q(`ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS details JSONB`);
+  await q(`ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS actor_email TEXT`);
+  await q(`ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS action TEXT`);
+  await q(`ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS target_type TEXT`);
+  await q(`ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS target_id TEXT`);
+  await q(`ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()`);
+
   await seedUser(ADMIN_EMAIL, ADMIN_PASSWORD, "admin", "Ejer / Admin", "ADMIN");
   await seedUser(EMPLOYEE_EMAIL, EMPLOYEE_PASSWORD, "employee", "Test Medarbejder", "TEST001");
   await q(`INSERT INTO employee_profiles (id, employee_id, name, email)
@@ -292,7 +307,7 @@ async function ensurePdTimeEntries() {
 }
 
 app.get("/health", async (req,res)=>{
-  try { await q("SELECT 1"); res.json({ ok:true, status:"healthy", version:VERSION, database:"connected", time:new Date().toISOString() }); }
+  try { await q("SELECT 1"); res.json({ ok:true, status:"healthy", version:VERSION, marker:"HARD_FIX_2_1_7", database:"connected", time:new Date().toISOString() }); }
   catch(e) { res.status(500).json({ ok:false, status:"unhealthy", version:VERSION, database:"error", error:e.message }); }
 });
 
@@ -345,8 +360,8 @@ app.post("/api/mobile/time-entry", auth(), async (req,res)=>{
     try {
       await q(`INSERT INTO time_entries
         (id, employee_id, employee_name, email, work_date, date, start_time, end_time, start, "end", pause_minutes, note, status, calculation_json)
-        VALUES ($1,$2,$3,$4,$5,$5,$6,$7,$6,$7,$8,$9,'Afventer',$10)`,
-        [id, employeeId, employeeName, req.user.email||"", date, start, end, pause, b.note||"", { hours }]);
+        VALUES ($1,$2,$3,$4,$5::date,$6::text,$7,$8,$7,$8,$9,$10,'Afventer',$11)`,
+        [id, employeeId, employeeName, req.user.email||"", date, date, start, end, pause, b.note||"", { hours }]);
     } catch (insertErr) {
       console.error("time entry insert failed", insertErr.message);
       throw insertErr;
