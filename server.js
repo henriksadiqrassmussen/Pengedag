@@ -101,7 +101,7 @@ app.use(makeRateLimiter('global', RATE_LIMIT_MAX, RATE_LIMIT_WINDOW_MS));
 // v1.6.18g: payslip month/date + work_date + hours fix.
 app.use(express.json({ limit: JSON_LIMIT }));
 
-const VERSION = '1.6.18i-payslip-date-safe-fix';
+const VERSION = '2.0.0-erhvervsklar';
 const PORT = process.env.PORT || 8080;
 const JWT_SECRET = process.env.JWT_SECRET || 'DEV_ONLY_CHANGE_ME_PENGEDAG';
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -341,6 +341,86 @@ async function initDb() {
     )
   `);
 
+
+  // Pengedag v2.0: medarbejderregister
+  await query(`
+    CREATE TABLE IF NOT EXISTS employees (
+      id TEXT PRIMARY KEY,
+      user_id TEXT DEFAULT '',
+      name TEXT NOT NULL,
+      email TEXT DEFAULT '',
+      phone TEXT DEFAULT '',
+      employment_type TEXT NOT NULL DEFAULT 'Vikar',
+      hourly_rate NUMERIC(12,2) NOT NULL DEFAULT 0,
+      overtime_rate NUMERIC(12,2) NOT NULL DEFAULT 0,
+      customer_rate NUMERIC(12,2) NOT NULL DEFAULT 0,
+      active BOOLEAN NOT NULL DEFAULT TRUE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  // Pengedag v2.0: kunderegister
+  await query(`
+    CREATE TABLE IF NOT EXISTS customers (
+      id TEXT PRIMARY KEY,
+      company_name TEXT NOT NULL,
+      cvr TEXT DEFAULT '',
+      contact_name TEXT DEFAULT '',
+      email TEXT DEFAULT '',
+      phone TEXT DEFAULT '',
+      address TEXT DEFAULT '',
+      postal_code TEXT DEFAULT '',
+      city TEXT DEFAULT '',
+      active BOOLEAN NOT NULL DEFAULT TRUE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  // Pengedag v2.0: fakturahoved
+  await query(`
+    CREATE TABLE IF NOT EXISTS invoices (
+      id TEXT PRIMARY KEY,
+      customer_id TEXT NOT NULL DEFAULT '',
+      invoice_number TEXT UNIQUE NOT NULL,
+      invoice_date DATE NOT NULL DEFAULT CURRENT_DATE,
+      due_date DATE,
+      currency TEXT NOT NULL DEFAULT 'DKK',
+      subtotal NUMERIC(14,2) NOT NULL DEFAULT 0,
+      vat_amount NUMERIC(14,2) NOT NULL DEFAULT 0,
+      total_amount NUMERIC(14,2) NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'Kladde',
+      notes TEXT DEFAULT '',
+      created_by TEXT DEFAULT '',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  // Pengedag v2.0: fakturalinjer
+  await query(`
+    CREATE TABLE IF NOT EXISTS invoice_lines (
+      id TEXT PRIMARY KEY,
+      invoice_id TEXT NOT NULL REFERENCES invoices(id) ON DELETE CASCADE,
+      description TEXT NOT NULL,
+      quantity NUMERIC(12,2) NOT NULL DEFAULT 1,
+      unit_price NUMERIC(14,2) NOT NULL DEFAULT 0,
+      vat_percent NUMERIC(6,2) NOT NULL DEFAULT 25,
+      line_total NUMERIC(14,2) NOT NULL DEFAULT 0,
+      time_entry_id TEXT DEFAULT '',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await addColumnIfMissing('payslips', 'gross_pay', 'NUMERIC(14,2) DEFAULT 0');
+  await addColumnIfMissing('payslips', 'net_pay', 'NUMERIC(14,2) DEFAULT 0');
+  await addColumnIfMissing('payslips', 'tax_amount', 'NUMERIC(14,2) DEFAULT 0');
+  await addColumnIfMissing('payslips', 'pension_amount', 'NUMERIC(14,2) DEFAULT 0');
+  await addColumnIfMissing('payslips', 'approved_by', "TEXT DEFAULT ''");
+  await addColumnIfMissing('payslips', 'approved_at', 'TIMESTAMPTZ');
+
+
   // 2) Migrations til gamle v1.6.0/v1.6.1 tabeller. Disse koerer foer indexes.
   await addColumnIfMissing('time_entries', 'user_id', "TEXT DEFAULT ''");
   await addColumnIfMissing('time_entries', 'employee_id', "TEXT DEFAULT ''");
@@ -413,6 +493,14 @@ async function initDb() {
   await safeCreateIndex('idx_attachments_uploader_user_id', 'attachments', 'uploader_user_id');
   await safeCreateIndex('idx_attachments_linked_id', 'attachments', 'linked_id');
   await safeCreateIndex('idx_attachments_sha256', 'attachments', 'sha256');
+
+
+  await safeCreateIndex('idx_employees_user_id', 'employees', 'user_id');
+  await safeCreateIndex('idx_employees_email', 'employees', 'email');
+  await safeCreateIndex('idx_customers_cvr', 'customers', 'cvr');
+  await safeCreateIndex('idx_invoices_customer_id', 'invoices', 'customer_id');
+  await safeCreateIndex('idx_invoices_invoice_number', 'invoices', 'invoice_number');
+  await safeCreateIndex('idx_invoice_lines_invoice_id', 'invoice_lines', 'invoice_id');
 
   console.log('Database migrations OK - Pengedag ' + VERSION);
 }
@@ -600,7 +688,7 @@ app.get('/health', async (req, res) => {
 
 app.get('/api/mobile/routes', (req, res) => res.json({ ok: true, version: VERSION, routes: [
   'GET /health', 'POST /api/auth/bootstrap-admin', 'POST /api/auth/login', 'GET /api/auth/me', 'POST /api/auth/change-password', 'POST /api/auth/users',
-  'POST /api/mobile/time-entry', 'GET /api/mobile/times', 'GET /api/employee/dashboard', 'POST /api/mobile/time-entries/:id/approve', 'POST /api/mobile/time-entries/:id/reject', 'POST /api/bilag/upload', 'GET /api/bilag', 'GET /api/bilag/:id', 'GET /api/bilag/:id/download', 'GET /api/admin/backup/export', 'POST /api/admin/backup/restore', 'GET /api/admin/revisor/export', 'GET /api/admin/saft/preview', 'GET /api/legal/gdpr', 'GET /api/legal/dpa', 'GET /api/gdpr/my-data', 'GET /api/admin/gdpr/export-user/:userId', 'POST /api/admin/gdpr/record-request', 'GET /api/admin/audit-log', 'GET /api/admin/audit-log/verify', 'GET /api/admin/security/status', 'POST /api/admin/security/record-check'
+  'POST /api/mobile/time-entry', 'GET /api/mobile/times', 'GET /api/employee/dashboard', 'POST /api/mobile/time-entries/:id/approve', 'POST /api/mobile/time-entries/:id/reject', 'POST /api/bilag/upload', 'GET /api/bilag', 'GET /api/bilag/:id', 'GET /api/bilag/:id/download', 'GET /api/admin/backup/export', 'POST /api/admin/backup/restore', 'GET /api/admin/revisor/export', 'GET /api/admin/saft/preview', 'GET /api/legal/gdpr', 'GET /api/legal/dpa', 'GET /api/gdpr/my-data', 'GET /api/admin/gdpr/export-user/:userId', 'POST /api/admin/gdpr/record-request', 'GET /api/admin/audit-log', 'GET /api/admin/audit-log/verify', 'GET /api/admin/security/status', 'POST /api/admin/security/record-check', 'GET/POST/PUT /api/employees', 'GET/POST/PUT /api/customers', 'GET/POST /api/invoices', 'GET /api/reports/dashboard'
 ]}));
 
 app.get('/api/admin/security/status', auth, requireRole('admin','auditor'), async (req, res) => {
@@ -1665,6 +1753,226 @@ app.get('/api/mobile/payslip/:employeeId', auth, async (req, res) => {
   const r = await query('SELECT * FROM payslips WHERE employee_id=$1 ORDER BY created_at DESC LIMIT 20', [req.params.employeeId]);
   res.json({ ok:true, count:r.rows.length, payslips:r.rows });
 });
+
+
+// -----------------------------------------------------------------------------
+// PENGEDAG V2.0 ERHVERVSMODULER
+// -----------------------------------------------------------------------------
+
+function cleanText(value, max = 255) {
+  return String(value ?? '').trim().slice(0, max);
+}
+
+function money(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? Math.round(n * 100) / 100 : 0;
+}
+
+app.get('/api/employees', auth, requireRole('admin','owner','auditor'), async (req, res) => {
+  const r = await query('SELECT * FROM employees ORDER BY active DESC, name ASC');
+  res.json({ ok: true, count: r.rows.length, employees: r.rows });
+});
+
+app.post('/api/employees', auth, requireRole('admin','owner'), async (req, res) => {
+  const body = req.body || {};
+  const name = cleanText(body.name, 180);
+  if (!name) return res.status(400).json({ ok:false, error:'Navn kræves', requestId:req.requestId });
+
+  const allowedTypes = ['Fastansat','Vikar','Freelancer'];
+  const employmentType = allowedTypes.includes(body.employmentType) ? body.employmentType : 'Vikar';
+  const id = cleanText(body.id, 100) || makeId('emp');
+
+  await query(`INSERT INTO employees
+    (id,user_id,name,email,phone,employment_type,hourly_rate,overtime_rate,customer_rate,active)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+    [id, cleanText(body.userId,100), name, cleanText(body.email,180).toLowerCase(),
+     cleanText(body.phone,50), employmentType, money(body.hourlyRate),
+     money(body.overtimeRate), money(body.customerRate), body.active !== false]
+  );
+  await audit(req.user,'CREATE_EMPLOYEE','employee',id,{ name, employmentType });
+  res.status(201).json({ ok:true, employee:(await query('SELECT * FROM employees WHERE id=$1',[id])).rows[0] });
+});
+
+app.put('/api/employees/:id', auth, requireRole('admin','owner'), async (req, res) => {
+  const body = req.body || {};
+  const allowedTypes = ['Fastansat','Vikar','Freelancer'];
+  const r = await query(`UPDATE employees SET
+      name=COALESCE(NULLIF($2,''),name),
+      email=$3, phone=$4,
+      employment_type=$5,
+      hourly_rate=$6, overtime_rate=$7, customer_rate=$8,
+      active=$9, updated_at=NOW()
+    WHERE id=$1 RETURNING *`,
+    [req.params.id, cleanText(body.name,180), cleanText(body.email,180).toLowerCase(),
+     cleanText(body.phone,50), allowedTypes.includes(body.employmentType) ? body.employmentType : 'Vikar',
+     money(body.hourlyRate), money(body.overtimeRate), money(body.customerRate), body.active !== false]
+  );
+  if (!r.rows.length) return res.status(404).json({ ok:false, error:'Medarbejder ikke fundet' });
+  await audit(req.user,'UPDATE_EMPLOYEE','employee',req.params.id,{ fields:Object.keys(body) });
+  res.json({ ok:true, employee:r.rows[0] });
+});
+
+app.patch('/api/employees/:id/status', auth, requireRole('admin','owner'), async (req, res) => {
+  const active = req.body?.active === true;
+  const r = await query('UPDATE employees SET active=$2,updated_at=NOW() WHERE id=$1 RETURNING *',[req.params.id,active]);
+  if (!r.rows.length) return res.status(404).json({ ok:false,error:'Medarbejder ikke fundet' });
+  await audit(req.user,'CHANGE_EMPLOYEE_STATUS','employee',req.params.id,{ active });
+  res.json({ ok:true, employee:r.rows[0] });
+});
+
+app.get('/api/customers', auth, requireRole('admin','owner','auditor'), async (req, res) => {
+  const r = await query('SELECT * FROM customers ORDER BY active DESC, company_name ASC');
+  res.json({ ok:true, count:r.rows.length, customers:r.rows });
+});
+
+app.post('/api/customers', auth, requireRole('admin','owner'), async (req, res) => {
+  const b = req.body || {};
+  const companyName = cleanText(b.companyName,200);
+  if (!companyName) return res.status(400).json({ ok:false,error:'Firmanavn kræves' });
+  const cvr = cleanText(b.cvr,20).replace(/\s/g,'');
+  if (cvr && !/^\d{8}$/.test(cvr)) return res.status(400).json({ ok:false,error:'CVR skal være 8 cifre' });
+  const id = cleanText(b.id,100) || makeId('cus');
+  await query(`INSERT INTO customers
+    (id,company_name,cvr,contact_name,email,phone,address,postal_code,city,active)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+    [id,companyName,cvr,cleanText(b.contactName,180),cleanText(b.email,180).toLowerCase(),
+     cleanText(b.phone,50),cleanText(b.address,250),cleanText(b.postalCode,20),
+     cleanText(b.city,100),b.active !== false]
+  );
+  await audit(req.user,'CREATE_CUSTOMER','customer',id,{ companyName,cvr });
+  res.status(201).json({ ok:true, customer:(await query('SELECT * FROM customers WHERE id=$1',[id])).rows[0] });
+});
+
+app.put('/api/customers/:id', auth, requireRole('admin','owner'), async (req, res) => {
+  const b = req.body || {};
+  const companyName = cleanText(b.companyName,200);
+  const cvr = cleanText(b.cvr,20).replace(/\s/g,'');
+  if (cvr && !/^\d{8}$/.test(cvr)) return res.status(400).json({ ok:false,error:'CVR skal være 8 cifre' });
+  const r = await query(`UPDATE customers SET
+      company_name=COALESCE(NULLIF($2,''),company_name), cvr=$3, contact_name=$4,
+      email=$5, phone=$6, address=$7, postal_code=$8, city=$9,
+      active=$10, updated_at=NOW()
+    WHERE id=$1 RETURNING *`,
+    [req.params.id,companyName,cvr,cleanText(b.contactName,180),cleanText(b.email,180).toLowerCase(),
+     cleanText(b.phone,50),cleanText(b.address,250),cleanText(b.postalCode,20),
+     cleanText(b.city,100),b.active !== false]
+  );
+  if (!r.rows.length) return res.status(404).json({ ok:false,error:'Kunde ikke fundet' });
+  await audit(req.user,'UPDATE_CUSTOMER','customer',req.params.id,{ fields:Object.keys(b) });
+  res.json({ ok:true, customer:r.rows[0] });
+});
+
+app.get('/api/invoices', auth, requireRole('admin','owner','auditor'), async (req, res) => {
+  const r = await query(`SELECT i.*,c.company_name,c.cvr
+    FROM invoices i LEFT JOIN customers c ON c.id=i.customer_id
+    ORDER BY i.created_at DESC LIMIT 500`);
+  res.json({ ok:true,count:r.rows.length,invoices:r.rows });
+});
+
+app.post('/api/invoices', auth, requireRole('admin','owner'), async (req, res) => {
+  const b = req.body || {};
+  const customerId = cleanText(b.customerId,100);
+  const customer = await query('SELECT id FROM customers WHERE id=$1 AND active=TRUE',[customerId]);
+  if (!customer.rows.length) return res.status(400).json({ ok:false,error:'Aktiv kunde ikke fundet' });
+
+  const invoiceNumber = cleanText(b.invoiceNumber,60);
+  if (!invoiceNumber) return res.status(400).json({ ok:false,error:'Fakturanummer kræves' });
+
+  const lines = Array.isArray(b.lines) ? b.lines : [];
+  if (!lines.length) return res.status(400).json({ ok:false,error:'Mindst én fakturalinje kræves' });
+
+  const normalized = lines.map(line => {
+    const quantity = money(line.quantity || 1);
+    const unitPrice = money(line.unitPrice);
+    const vatPercent = money(line.vatPercent ?? 25);
+    return {
+      id: makeId('line'),
+      description: cleanText(line.description,500) || 'Arbejdstimer',
+      quantity, unitPrice, vatPercent,
+      lineTotal: money(quantity * unitPrice),
+      timeEntryId: cleanText(line.timeEntryId,100)
+    };
+  });
+
+  const subtotal = money(normalized.reduce((s,x) => s + x.lineTotal,0));
+  const vatAmount = money(normalized.reduce((s,x) => s + x.lineTotal * x.vatPercent / 100,0));
+  const totalAmount = money(subtotal + vatAmount);
+  const id = makeId('inv');
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(`INSERT INTO invoices
+      (id,customer_id,invoice_number,invoice_date,due_date,currency,subtotal,vat_amount,total_amount,status,notes,created_by)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+      [id,customerId,invoiceNumber,b.invoiceDate || new Date().toISOString().slice(0,10),
+       b.dueDate || null,'DKK',subtotal,vatAmount,totalAmount,'Kladde',
+       cleanText(b.notes,1000),req.user.id]
+    );
+    for (const line of normalized) {
+      await client.query(`INSERT INTO invoice_lines
+        (id,invoice_id,description,quantity,unit_price,vat_percent,line_total,time_entry_id)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+        [line.id,id,line.description,line.quantity,line.unitPrice,line.vatPercent,line.lineTotal,line.timeEntryId]
+      );
+    }
+    await client.query('COMMIT');
+  } catch (e) {
+    await client.query('ROLLBACK');
+    if (e.code === '23505') return res.status(409).json({ ok:false,error:'Fakturanummer findes allerede' });
+    throw e;
+  } finally {
+    client.release();
+  }
+
+  await audit(req.user,'CREATE_INVOICE','invoice',id,{ invoiceNumber,customerId,subtotal,vatAmount,totalAmount });
+  res.status(201).json({ ok:true,invoice:{ id,invoiceNumber,customerId,subtotal,vatAmount,totalAmount,status:'Kladde' } });
+});
+
+app.get('/api/invoices/:id', auth, requireRole('admin','owner','auditor'), async (req, res) => {
+  const invoice = await query(`SELECT i.*,c.company_name,c.cvr,c.email AS customer_email,
+    c.address,c.postal_code,c.city
+    FROM invoices i LEFT JOIN customers c ON c.id=i.customer_id WHERE i.id=$1`,[req.params.id]);
+  if (!invoice.rows.length) return res.status(404).json({ ok:false,error:'Faktura ikke fundet' });
+  const lines = await query('SELECT * FROM invoice_lines WHERE invoice_id=$1 ORDER BY created_at,id',[req.params.id]);
+  res.json({ ok:true,invoice:invoice.rows[0],lines:lines.rows });
+});
+
+app.patch('/api/invoices/:id/status', auth, requireRole('admin','owner'), async (req, res) => {
+  const allowed = ['Kladde','Godkendt','Sendt','Betalt','Annulleret'];
+  const status = cleanText(req.body?.status,30);
+  if (!allowed.includes(status)) return res.status(400).json({ ok:false,error:'Ugyldig fakturastatus',allowed });
+  const r = await query('UPDATE invoices SET status=$2,updated_at=NOW() WHERE id=$1 RETURNING *',[req.params.id,status]);
+  if (!r.rows.length) return res.status(404).json({ ok:false,error:'Faktura ikke fundet' });
+  await audit(req.user,'CHANGE_INVOICE_STATUS','invoice',req.params.id,{ status });
+  res.json({ ok:true,invoice:r.rows[0] });
+});
+
+app.get('/api/reports/dashboard', auth, requireRole('admin','owner','auditor'), async (req, res) => {
+  const [employees,customers,timeEntries,payslips,invoices] = await Promise.all([
+    query('SELECT COUNT(*)::int AS total,COUNT(*) FILTER (WHERE active)::int AS active FROM employees'),
+    query('SELECT COUNT(*)::int AS total,COUNT(*) FILTER (WHERE active)::int AS active FROM customers'),
+    query(`SELECT COUNT(*)::int AS total,
+      COUNT(*) FILTER (WHERE status='Afventer')::int AS pending,
+      COUNT(*) FILTER (WHERE status='Godkendt')::int AS approved
+      FROM time_entries`),
+    query('SELECT COUNT(*)::int AS total,COALESCE(SUM(gross_pay),0)::numeric AS gross_pay FROM payslips'),
+    query(`SELECT COUNT(*)::int AS total,
+      COALESCE(SUM(total_amount),0)::numeric AS total_amount,
+      COALESCE(SUM(total_amount) FILTER (WHERE status='Betalt'),0)::numeric AS paid_amount
+      FROM invoices`)
+  ]);
+  res.json({
+    ok:true,
+    version:VERSION,
+    employees:employees.rows[0],
+    customers:customers.rows[0],
+    timeEntries:timeEntries.rows[0],
+    payslips:payslips.rows[0],
+    invoices:invoices.rows[0]
+  });
+});
+
 
 app.use((err, req, res, next) => {
   if (err && err.type === 'entity.too.large') {
