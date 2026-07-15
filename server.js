@@ -405,16 +405,43 @@ app.get("/api/employee/my-salary-settings", auth(), async (req,res)=>{
 app.post("/api/admin/payroll/calculate", auth("admin"), async (req,res)=>{
   try {
     const c = await calculatePayroll(String(req.body.employeeId || "TEST001"), String(req.body.period || new Date().toISOString().slice(0,7)));
-    const id = uid("paycalc");
-    await q(`INSERT INTO payroll_calculations
-      (id, employee_id, employee_name, period, period_start, period_end, normal_hours, overtime_hours, total_hours, normal_rate, overtime_rate,
-       customer_rate, gross_salary, pension_employee, pension_employer, am_bidrag, tax_amount, deduction, net_salary, revenue, margin, payload)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)`,
-      [id,c.employeeId,c.employeeName,c.period,c.periodStart,c.periodEnd,c.normalHours,c.overtimeHours,c.totalHours,c.normalRate,c.overtimeRate,
-       c.customerRate,c.grossSalary,c.pensionEmployee,c.pensionEmployer,c.amBidrag,c.taxAmount,c.deduction,c.netSalary,c.revenue,c.margin,c]);
-    await audit(req.user, "CALCULATE_PAYROLL", "payroll_calculation", id, { employeeId:c.employeeId, period:c.period, netSalary:c.netSalary });
-    res.json({ ok:true, id, calculation:c });
-  } catch(e) { res.status(500).json({ ok:false, error:"Kunne ikke beregne løn", details:e.message }); }
+
+    // Vigtigt: returnér altid beregningen først. Database-log må ikke vælte lønknappen.
+    try {
+      await q(`CREATE TABLE IF NOT EXISTS pd_payroll_calculations (
+        id TEXT PRIMARY KEY,
+        employee_id TEXT,
+        employee_name TEXT,
+        period TEXT,
+        total_hours NUMERIC DEFAULT 0,
+        gross_salary NUMERIC DEFAULT 0,
+        pension_employee NUMERIC DEFAULT 0,
+        pension_employer NUMERIC DEFAULT 0,
+        am_bidrag NUMERIC DEFAULT 0,
+        tax_amount NUMERIC DEFAULT 0,
+        net_salary NUMERIC DEFAULT 0,
+        revenue NUMERIC DEFAULT 0,
+        margin NUMERIC DEFAULT 0,
+        payload JSONB,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )`);
+      const id = uid("paycalc");
+      await q(`INSERT INTO pd_payroll_calculations
+        (id, employee_id, employee_name, period, total_hours, gross_salary, pension_employee, pension_employer,
+         am_bidrag, tax_amount, net_salary, revenue, margin, payload)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+        [id,c.employeeId,c.employeeName,c.period,c.totalHours,c.grossSalary,c.pensionEmployee,c.pensionEmployer,
+         c.amBidrag,c.taxAmount,c.netSalary,c.revenue,c.margin,c]);
+      await audit(req.user, "CALCULATE_PAYROLL", "pd_payroll_calculation", id, { employeeId:c.employeeId, period:c.period, netSalary:c.netSalary });
+      return res.json({ ok:true, id, calculation:c });
+    } catch(logErr) {
+      console.error("PAYROLL_LOG_WARNING", logErr.message);
+      return res.json({ ok:true, warning:"Løn beregnet, men database-log blev sprunget over", logDetails:logErr.message, calculation:c });
+    }
+  } catch(e) {
+    console.error("PAYROLL_CALCULATE_ERROR", e);
+    res.status(500).json({ ok:false, error:"Kunne ikke beregne løn", details:e.message, code:e.code || null });
+  }
 });
 
 app.post("/api/mobile/payslip", auth(), async (req,res)=>{
@@ -462,7 +489,10 @@ app.get("/api/admin/reports/summary", auth("admin"), async (req,res)=>{
     const c = await calculatePayroll(String(req.query.employeeId || "TEST001"), String(req.query.period || new Date().toISOString().slice(0,7)));
     res.json({ ok:true, report:{ totalHours:c.totalHours, approvedEntries:c.approvedEntries, grossSalary:c.grossSalary,
       netSalary:c.netSalary, revenue:c.revenue, margin:c.margin, taxAmount:c.taxAmount, amBidrag:c.amBidrag } });
-  } catch(e) { res.status(500).json({ ok:false, error:"Kunne ikke hente rapport", details:e.message }); }
+  } catch(e) {
+    console.error("REPORT_SUMMARY_ERROR", e);
+    res.status(500).json({ ok:false, error:"Kunne ikke hente rapport", details:e.message, code:e.code || null });
+  }
 });
 
 app.get("/api/admin/audit-log/verify", auth("admin"), async (req,res)=>{
