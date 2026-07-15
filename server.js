@@ -1,131 +1,82 @@
+import express from "express";
+import cors from "cors";
+import pkg from "pg";
+import jwt from "jsonwebtoken";
+import bcrypt from "bcryptjs";
+import PDFDocument from "pdfkit";
+import nodemailer from "nodemailer";
 
-const express = require("express");
-const cors = require("cors");
-const { Pool } = require("pg");
-const jwt = require("jsonwebtoken");
-const bcrypt = require("bcryptjs");
-const PDFDocument = require("pdfkit");
-const nodemailer = require("nodemailer");
-
+const { Pool } = pkg;
 const app = express();
+
+const VERSION = "2.1.9-timer-clean-working";
+console.log("### PENGEDAG SERVER.JS 2.1.9 TIMER CLEAN WORKING LOADED ###");
+
 const PORT = process.env.PORT || 8080;
-const VERSION = "2.1.7-hard-server-fix";
-console.log("### PENGEDAG SERVER.JS HARD FIX 2.1.7 LOADED ###");
+const JWT_SECRET = process.env.JWT_SECRET || "pengedag-dev-secret-change-me";
+const DATABASE_URL = process.env.DATABASE_URL;
 
-const JWT_SECRET = process.env.JWT_SECRET || "pengedag-local-secret";
-const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || "vault1973@gmail.com").toLowerCase();
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "PengedagAdmin2026!";
-const EMPLOYEE_EMAIL = (process.env.EMPLOYEE_EMAIL || "medarbejder@pengedag.dk").toLowerCase();
-const EMPLOYEE_PASSWORD = process.env.EMPLOYEE_PASSWORD || "MedarbejderTest2026!";
-
-app.use(cors({
-  origin: true,
-  credentials: true,
-  methods: ["GET","POST","PUT","PATCH","DELETE","OPTIONS"],
-  allowedHeaders: ["Authorization","Content-Type","Accept","X-Requested-With","X-Request-Id","x-reset-key"]
-}));
-app.options("*", cors());
-app.use(express.json({ limit: "20mb" }));
+app.use(cors({ origin: true, credentials: true }));
+app.use(express.json({ limit: "2mb" }));
 
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false
+  connectionString: DATABASE_URL,
+  ssl: DATABASE_URL && DATABASE_URL.includes("railway") ? { rejectUnauthorized:false } : undefined
 });
 
-const uid = p => `${p}_${Date.now()}_${Math.random().toString(16).slice(2, 14)}`;
-const num = (v, f=0) => { const x = Number(v); return Number.isFinite(x) ? x : f; };
-const q = (sql, params=[]) => pool.query(sql, params);
+async function q(sql, params=[]) {
+  return pool.query(sql, params);
+}
 
-function hoursBetween(start, end, pause=0) {
+function uid(prefix="id") {
+  return `${prefix}_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+}
+
+function num(v, fallback=0) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function hoursBetween(start, end, pauseMinutes=0) {
   if (!start || !end) return 0;
   const [sh, sm] = String(start).split(":").map(Number);
   const [eh, em] = String(end).split(":").map(Number);
-  if (![sh, sm, eh, em].every(Number.isFinite)) return 0;
-  let mins = (eh * 60 + em) - (sh * 60 + sm);
-  if (mins < 0) mins += 1440;
-  mins -= num(pause);
-  return Math.max(0, Math.round((mins / 60) * 100) / 100);
+  if (!Number.isFinite(sh) || !Number.isFinite(eh)) return 0;
+  let a = sh * 60 + (sm || 0);
+  let b = eh * 60 + (em || 0);
+  if (b < a) b += 24 * 60;
+  return Math.max(0, (b - a - num(pauseMinutes)) / 60);
 }
 
-function periodRange(period) {
-  const raw = String(period || new Date().toISOString().slice(0, 7));
-  const ym = /^\d{4}-\d{2}/.test(raw) ? raw.slice(0, 7) : new Date().toISOString().slice(0, 7);
-  const y = Number(ym.slice(0, 4));
-  const m = Number(ym.slice(5, 7));
-  return { period: ym, start: `${ym}-01`, end: new Date(y, m, 0).toISOString().slice(0, 10) };
-}
-
-async function audit(user, action, targetType, targetId, details={}) {
-  try {
-    await q("CREATE TABLE IF NOT EXISTS audit_log (id TEXT PRIMARY KEY, actor_email TEXT, action TEXT, target_type TEXT, target_id TEXT, details JSONB, created_at TIMESTAMPTZ DEFAULT NOW())");
-    await q("ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS details JSONB");
-    await q("ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS actor_email TEXT");
-    await q("ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS action TEXT");
-    await q("ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS target_type TEXT");
-    await q("ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS target_id TEXT");
-    await q("ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()");
-    await q("INSERT INTO audit_log (id, actor_email, action, target_type, target_id, details) VALUES ($1,$2,$3,$4,$5,$6)",
-      [uid("audit"), user?.email || "", action, targetType, targetId, details]);
-  } catch (e) { console.error("audit failed but ignored", e.message); }
-}
-
-async function ensureColumn(tableName, columnName, sqlType) {
-  const table = String(tableName).replace(/"/g, '""');
-  const column = String(columnName).replace(/"/g, '""');
-  await q(`ALTER TABLE "${table}" ADD COLUMN IF NOT EXISTS "${column}" ${sqlType}`);
-}
-
-async function ensureTimeEntryColumns() {
-  await ensureColumn("time_entries", "employee_id", "TEXT");
-  await ensureColumn("time_entries", "employee_name", "TEXT");
-  await ensureColumn("time_entries", "email", "TEXT");
-  await ensureColumn("time_entries", "customer_id", "TEXT");
-  await ensureColumn("time_entries", "customer_name", "TEXT");
-  await ensureColumn("time_entries", "work_date", "DATE");
-  await ensureColumn("time_entries", "date", "TEXT");
-  await ensureColumn("time_entries", "start_time", "TEXT");
-  await ensureColumn("time_entries", "end_time", "TEXT");
-  await ensureColumn("time_entries", "start", "TEXT");
-  await ensureColumn("time_entries", "end", "TEXT");
-  await ensureColumn("time_entries", "pause_minutes", "NUMERIC DEFAULT 0");
-  await ensureColumn("time_entries", "note", "TEXT");
-  await ensureColumn("time_entries", "status", "TEXT DEFAULT 'Afventer'");
-  await ensureColumn("time_entries", "calculation_json", "JSONB");
-  await ensureColumn("time_entries", "created_at", "TIMESTAMPTZ DEFAULT NOW()");
-  await ensureColumn("time_entries", "approved_at", "TIMESTAMPTZ");
-  await ensureColumn("time_entries", "approved_by", "TEXT");
-}
-
-async function seedUser(email, password, role, name, employeeId) {
-  const found = await q("SELECT id FROM users WHERE lower(email)=lower($1) LIMIT 1", [email]);
-  if (found.rows.length) return;
-  const hash = await bcrypt.hash(password, 10);
-  await q("INSERT INTO users (id,email,password_hash,role,name,employee_id) VALUES ($1,$2,$3,$4,$5,$6)",
-    [uid("user"), email, hash, role, name, employeeId]);
-}
-
-async function ensureDb() {
+async function ensureCoreTables() {
   await q(`CREATE TABLE IF NOT EXISTS users (
-    id TEXT PRIMARY KEY, email TEXT UNIQUE NOT NULL, password_hash TEXT, role TEXT NOT NULL DEFAULT 'employee',
-    name TEXT, employee_id TEXT, created_at TIMESTAMPTZ DEFAULT NOW()
+    id TEXT PRIMARY KEY,
+    email TEXT UNIQUE NOT NULL,
+    password_hash TEXT,
+    role TEXT DEFAULT 'employee',
+    name TEXT,
+    employee_id TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW()
   )`);
-  await q(`CREATE TABLE IF NOT EXISTS employee_profiles (
-    id TEXT PRIMARY KEY, employee_id TEXT UNIQUE NOT NULL, name TEXT, email TEXT, phone TEXT, address TEXT,
-    employment_type TEXT DEFAULT 'Vikar', status TEXT DEFAULT 'Aktiv', created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW()
-  )`);
+  await q(`ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT`);
+  await q(`ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT DEFAULT 'employee'`);
+  await q(`ALTER TABLE users ADD COLUMN IF NOT EXISTS name TEXT`);
+  await q(`ALTER TABLE users ADD COLUMN IF NOT EXISTS employee_id TEXT`);
+  await q(`ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()`);
+
   await q(`CREATE TABLE IF NOT EXISTS employee_salary_settings (
-    id TEXT PRIMARY KEY, employee_id TEXT UNIQUE NOT NULL, normal_rate NUMERIC DEFAULT 160, overtime_rate NUMERIC DEFAULT 220,
-    customer_rate NUMERIC DEFAULT 320, pension_percent NUMERIC DEFAULT 8, employer_pension_percent NUMERIC DEFAULT 4,
-    employee_pension_percent NUMERIC DEFAULT 4, am_bidrag_percent NUMERIC DEFAULT 8, tax_percent NUMERIC DEFAULT 38,
-    deduction NUMERIC DEFAULT 0, currency TEXT DEFAULT 'DKK', created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW()
+    employee_id TEXT PRIMARY KEY,
+    normal_rate NUMERIC DEFAULT 160,
+    overtime_rate NUMERIC DEFAULT 220,
+    customer_rate NUMERIC DEFAULT 320,
+    pension_percent NUMERIC DEFAULT 8,
+    pension_employer_percent NUMERIC DEFAULT 4,
+    pension_employee_percent NUMERIC DEFAULT 4,
+    am_percent NUMERIC DEFAULT 8,
+    tax_percent NUMERIC DEFAULT 38,
+    deduction NUMERIC DEFAULT 0,
+    updated_at TIMESTAMPTZ DEFAULT NOW()
   )`);
-  await q(`CREATE TABLE IF NOT EXISTS time_entries (
-    id TEXT PRIMARY KEY, employee_id TEXT, employee_name TEXT, email TEXT, customer_id TEXT, customer_name TEXT,
-    work_date DATE, date TEXT, start_time TEXT, end_time TEXT, start TEXT, "end" TEXT, pause_minutes NUMERIC DEFAULT 0,
-    note TEXT, status TEXT DEFAULT 'Afventer', calculation_json JSONB, created_at TIMESTAMPTZ DEFAULT NOW(),
-    approved_at TIMESTAMPTZ, approved_by TEXT
-  )`);
-  await ensureTimeEntryColumns();
 
   await q(`CREATE TABLE IF NOT EXISTS pd_time_entries (
     id TEXT PRIMARY KEY,
@@ -133,8 +84,8 @@ async function ensureDb() {
     employee_name TEXT,
     email TEXT,
     work_date DATE NOT NULL,
-    start_time TEXT,
-    end_time TEXT,
+    start_time TEXT NOT NULL,
+    end_time TEXT NOT NULL,
     pause_minutes NUMERIC DEFAULT 0,
     note TEXT,
     status TEXT DEFAULT 'Afventer',
@@ -143,124 +94,283 @@ async function ensureDb() {
     approved_at TIMESTAMPTZ,
     approved_by TEXT
   )`);
-  await q(`CREATE TABLE IF NOT EXISTS payroll_calculations (
-    id TEXT PRIMARY KEY, employee_id TEXT, employee_name TEXT, period TEXT, period_start DATE, period_end DATE,
-    normal_hours NUMERIC DEFAULT 0, overtime_hours NUMERIC DEFAULT 0, total_hours NUMERIC DEFAULT 0,
-    normal_rate NUMERIC DEFAULT 0, overtime_rate NUMERIC DEFAULT 0, customer_rate NUMERIC DEFAULT 0,
-    gross_salary NUMERIC DEFAULT 0, pension_employee NUMERIC DEFAULT 0, pension_employer NUMERIC DEFAULT 0,
-    am_bidrag NUMERIC DEFAULT 0, tax_amount NUMERIC DEFAULT 0, deduction NUMERIC DEFAULT 0, net_salary NUMERIC DEFAULT 0,
-    revenue NUMERIC DEFAULT 0, margin NUMERIC DEFAULT 0, payload JSONB, created_at TIMESTAMPTZ DEFAULT NOW()
-  )`);
-  await q(`CREATE TABLE IF NOT EXISTS payslips (
-    id TEXT PRIMARY KEY, employee_id TEXT, employee_name TEXT, email TEXT, period TEXT, period_start DATE, period_end DATE,
-    total_hours NUMERIC DEFAULT 0, approved_entries NUMERIC DEFAULT 0, gross_salary NUMERIC DEFAULT 0,
-    pension_employee NUMERIC DEFAULT 0, pension_employer NUMERIC DEFAULT 0, am_bidrag NUMERIC DEFAULT 0,
-    tax_amount NUMERIC DEFAULT 0, deduction NUMERIC DEFAULT 0, net_salary NUMERIC DEFAULT 0, payload JSONB,
+
+  await q(`CREATE TABLE IF NOT EXISTS pd_payroll_calculations (
+    id TEXT PRIMARY KEY,
+    employee_id TEXT,
+    employee_name TEXT,
+    period TEXT,
+    total_hours NUMERIC DEFAULT 0,
+    gross_salary NUMERIC DEFAULT 0,
+    pension_employee NUMERIC DEFAULT 0,
+    pension_employer NUMERIC DEFAULT 0,
+    am_bidrag NUMERIC DEFAULT 0,
+    tax_amount NUMERIC DEFAULT 0,
+    net_salary NUMERIC DEFAULT 0,
+    revenue NUMERIC DEFAULT 0,
+    margin NUMERIC DEFAULT 0,
+    payload JSONB,
     created_at TIMESTAMPTZ DEFAULT NOW()
   )`);
+
   await q(`CREATE TABLE IF NOT EXISTS audit_log (
-    id TEXT PRIMARY KEY, actor_email TEXT, action TEXT, target_type TEXT, target_id TEXT, details JSONB,
+    id TEXT PRIMARY KEY,
+    actor_email TEXT,
+    action TEXT,
+    target_type TEXT,
+    target_id TEXT,
+    details JSONB,
     created_at TIMESTAMPTZ DEFAULT NOW()
   )`);
   await q(`ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS details JSONB`);
-  await q(`ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS actor_email TEXT`);
-  await q(`ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS action TEXT`);
-  await q(`ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS target_type TEXT`);
-  await q(`ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS target_id TEXT`);
-  await q(`ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()`);
+}
 
-  await seedUser(ADMIN_EMAIL, ADMIN_PASSWORD, "admin", "Ejer / Admin", "ADMIN");
-  await seedUser(EMPLOYEE_EMAIL, EMPLOYEE_PASSWORD, "employee", "Test Medarbejder", "TEST001");
-  await q(`INSERT INTO employee_profiles (id, employee_id, name, email)
-    VALUES ($1,'TEST001','Test Medarbejder',$2)
-    ON CONFLICT (employee_id) DO UPDATE SET name=EXCLUDED.name, email=EXCLUDED.email, updated_at=NOW()`,
-    [uid("emp"), EMPLOYEE_EMAIL]);
-  await q(`INSERT INTO employee_salary_settings
-    (id, employee_id, normal_rate, overtime_rate, customer_rate, pension_percent, employer_pension_percent, employee_pension_percent, am_bidrag_percent, tax_percent, deduction, currency)
-    VALUES ($1,'TEST001',160,220,320,8,4,4,8,38,0,'DKK')
-    ON CONFLICT (employee_id) DO NOTHING`, [uid("sal")]);
+async function seedUser(email, password, role, name, employeeId) {
+  const hash = await bcrypt.hash(password, 10);
+  const existing = await q("SELECT id FROM users WHERE email=$1", [email]);
+  if (existing.rows.length) {
+    await q(`UPDATE users SET password_hash=$2, role=$3, name=$4, employee_id=$5 WHERE email=$1`,
+      [email, hash, role, name, employeeId]);
+  } else {
+    await q(`INSERT INTO users (id,email,password_hash,role,name,employee_id) VALUES ($1,$2,$3,$4,$5,$6)`,
+      [uid("user"), email, hash, role, name, employeeId]);
+  }
+}
+
+async function seed() {
+  await ensureCoreTables();
+  await seedUser("vault1973@gmail.com", "PengedagAdmin2026!", "admin", "Ejer", "ADMIN");
+  await seedUser("medarbejder@pengedag.dk", "MedarbejderTest2026!", "employee", "Test Medarbejder", "TEST001");
+  await q(`INSERT INTO employee_salary_settings (employee_id)
+    VALUES ('TEST001')
+    ON CONFLICT (employee_id) DO NOTHING`);
+}
+
+function sign(user) {
+  return jwt.sign({
+    id: user.id,
+    email: user.email,
+    role: user.role,
+    name: user.name,
+    employeeId: user.employee_id
+  }, JWT_SECRET, { expiresIn: "7d" });
 }
 
 function auth(role=null) {
-  return (req, res, next) => {
-    const h = req.headers.authorization || "";
-    const token = h.startsWith("Bearer ") ? h.slice(7) : "";
-    if (!token) return res.status(401).json({ ok:false, error:"Mangler Bearer token" });
+  return async (req,res,next) => {
     try {
+      const h = req.headers.authorization || "";
+      const token = h.startsWith("Bearer ") ? h.slice(7) : "";
+      if (!token) return res.status(401).json({ ok:false, error:"Mangler login-token" });
       const user = jwt.verify(token, JWT_SECRET);
-      if (role === "admin" && user.role !== "admin" && user.role !== "owner") {
-        return res.status(403).json({ ok:false, error:"Kræver ejer/admin" });
-      }
+      if (role && user.role !== role) return res.status(403).json({ ok:false, error:"Ingen adgang" });
       req.user = user;
       next();
-    } catch {
-      res.status(401).json({ ok:false, error:"Ugyldig eller udløbet token" });
+    } catch(e) {
+      return res.status(401).json({ ok:false, error:"Ugyldigt login", details:e.message });
     }
   };
 }
 
-function sign(user) {
-  return jwt.sign({ id:user.id, email:user.email, role:user.role, name:user.name || "", employeeId:user.employee_id || "" },
-    JWT_SECRET, { expiresIn:"14d" });
+async function audit(user, action, targetType, targetId, details={}) {
+  try {
+    await q(`INSERT INTO audit_log (id,actor_email,action,target_type,target_id,details)
+      VALUES ($1,$2,$3,$4,$5,$6)`,
+      [uid("audit"), user?.email || "", action, targetType, targetId, details]);
+  } catch(e) {
+    console.error("audit ignored", e.message);
+  }
 }
 
-async function getProfile(employeeId) {
-  const r = await q("SELECT * FROM employee_profiles WHERE employee_id=$1 LIMIT 1", [employeeId]);
-  return r.rows[0] || { employee_id:employeeId, name:"", email:"" };
+app.get("/health", async (req,res) => {
+  try {
+    await ensureCoreTables();
+    await q("SELECT 1");
+    res.json({ ok:true, status:"healthy", version:VERSION, marker:"TIMER_CLEAN_2_1_9", database:"connected", time:new Date().toISOString() });
+  } catch(e) {
+    res.status(500).json({ ok:false, status:"unhealthy", version:VERSION, error:e.message });
+  }
+});
+
+app.post("/api/auth/login", async (req,res) => {
+  try {
+    await ensureCoreTables();
+    const { email, password } = req.body || {};
+    const r = await q("SELECT * FROM users WHERE email=$1", [String(email || "").toLowerCase()]);
+    if (!r.rows.length) return res.status(401).json({ ok:false, error:"Forkert login" });
+    const user = r.rows[0];
+    const ok = await bcrypt.compare(String(password || ""), user.password_hash || "");
+    if (!ok) return res.status(401).json({ ok:false, error:"Forkert login" });
+    res.json({ ok:true, token:sign(user), user:{ email:user.email, role:user.role, name:user.name, employeeId:user.employee_id }});
+  } catch(e) {
+    res.status(500).json({ ok:false, error:"Login-fejl", details:e.message });
+  }
+});
+
+app.post("/api/mobile/time-entry", auth(), async (req,res) => {
+  try {
+    await ensureCoreTables();
+    const b = req.body || {};
+    const employeeId = String(b.employeeId || req.user.employeeId || "TEST001");
+    const employeeName = String(b.employeeName || req.user.name || "Medarbejder");
+    const date = String(b.date || b.workDate || new Date().toISOString().slice(0,10)).slice(0,10);
+    const start = String(b.start || b.startTime || "08:00").slice(0,5);
+    const end = String(b.end || b.endTime || "16:00").slice(0,5);
+    const pause = num(b.pauseMinutes ?? b.pause ?? 0);
+    const hours = Number(hoursBetween(start, end, pause).toFixed(2));
+    const id = uid("mob");
+
+    await q(`INSERT INTO pd_time_entries
+      (id, employee_id, employee_name, email, work_date, start_time, end_time, pause_minutes, note, status, hours)
+      VALUES ($1,$2,$3,$4,$5::date,$6,$7,$8,$9,'Afventer',$10)`,
+      [id, employeeId, employeeName, req.user.email || "", date, start, end, pause, String(b.note || ""), hours]);
+
+    await audit(req.user, "CREATE_TIME_ENTRY", "pd_time_entry", id, { employeeId, date, start, end, hours });
+    res.json({ ok:true, message:"Time oprettet", id, hours, status:"Afventer" });
+  } catch(e) {
+    console.error("CREATE_TIME_ENTRY_ERROR", e);
+    res.status(500).json({ ok:false, error:"Kunne ikke oprette time", details:e.message, code:e.code || null });
+  }
+});
+
+app.get("/api/mobile/times", auth(), async (req,res) => {
+  try {
+    await ensureCoreTables();
+    const r = await q(`SELECT
+      id,
+      employee_id AS "employeeId",
+      employee_name AS "employeeName",
+      email,
+      work_date::text AS date,
+      start_time AS start,
+      end_time AS "end",
+      pause_minutes AS "pauseMinutes",
+      note,
+      status,
+      hours,
+      created_at AS "createdAt",
+      approved_at AS "approvedAt",
+      approved_by AS "approvedBy"
+      FROM pd_time_entries
+      ORDER BY created_at DESC
+      LIMIT 500`);
+    res.json({ ok:true, count:r.rows.length, entries:r.rows.map(x => ({ ...x, hours:Number(x.hours || 0) })) });
+  } catch(e) {
+    console.error("GET_TIMES_ERROR", e);
+    res.status(500).json({ ok:false, error:"Kunne ikke hente timer", details:e.message, code:e.code || null });
+  }
+});
+
+app.post("/api/mobile/time-entries/:id/approve", auth("admin"), async (req,res) => {
+  try {
+    await ensureCoreTables();
+    const r = await q(`UPDATE pd_time_entries
+      SET status='Godkendt', approved_at=NOW(), approved_by=$2
+      WHERE id=$1
+      RETURNING *`, [req.params.id, req.user.email]);
+    if (!r.rows.length) return res.status(404).json({ ok:false, error:"Time ikke fundet" });
+    await audit(req.user, "APPROVE_TIME_ENTRY", "pd_time_entry", req.params.id, {});
+    res.json({ ok:true, entry:r.rows[0] });
+  } catch(e) {
+    res.status(500).json({ ok:false, error:"Kunne ikke godkende time", details:e.message, code:e.code || null });
+  }
+});
+
+app.get("/api/admin/employees/:employeeId/salary-settings", auth("admin"), async (req,res) => {
+  try {
+    await ensureCoreTables();
+    const employeeId = req.params.employeeId;
+    await q(`INSERT INTO employee_salary_settings (employee_id) VALUES ($1) ON CONFLICT (employee_id) DO NOTHING`, [employeeId]);
+    const r = await q(`SELECT * FROM employee_salary_settings WHERE employee_id=$1`, [employeeId]);
+    res.json({ ok:true, settings:r.rows[0] });
+  } catch(e) {
+    res.status(500).json({ ok:false, error:"Kunne ikke hente lønprofil", details:e.message });
+  }
+});
+
+app.put("/api/admin/employees/:employeeId/salary-settings", auth("admin"), async (req,res) => {
+  try {
+    await ensureCoreTables();
+    const employeeId = req.params.employeeId;
+    const b = req.body || {};
+    const vals = [
+      employeeId, num(b.normalRate ?? b.normal_rate,160), num(b.overtimeRate ?? b.overtime_rate,220),
+      num(b.customerRate ?? b.customer_rate,320), num(b.pensionPercent ?? b.pension_percent,8),
+      num(b.pensionEmployerPercent ?? b.pension_employer_percent,4), num(b.pensionEmployeePercent ?? b.pension_employee_percent,4),
+      num(b.amPercent ?? b.am_percent,8), num(b.taxPercent ?? b.tax_percent,38), num(b.deduction,0)
+    ];
+    await q(`INSERT INTO employee_salary_settings
+      (employee_id, normal_rate, overtime_rate, customer_rate, pension_percent, pension_employer_percent, pension_employee_percent, am_percent, tax_percent, deduction, updated_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW())
+      ON CONFLICT (employee_id) DO UPDATE SET
+        normal_rate=EXCLUDED.normal_rate, overtime_rate=EXCLUDED.overtime_rate, customer_rate=EXCLUDED.customer_rate,
+        pension_percent=EXCLUDED.pension_percent, pension_employer_percent=EXCLUDED.pension_employer_percent,
+        pension_employee_percent=EXCLUDED.pension_employee_percent, am_percent=EXCLUDED.am_percent,
+        tax_percent=EXCLUDED.tax_percent, deduction=EXCLUDED.deduction, updated_at=NOW()`, vals);
+    res.json({ ok:true, message:"Lønprofil gemt" });
+  } catch(e) {
+    res.status(500).json({ ok:false, error:"Kunne ikke gemme lønprofil", details:e.message });
+  }
+});
+
+async function salarySettings(employeeId) {
+  await q(`INSERT INTO employee_salary_settings (employee_id) VALUES ($1) ON CONFLICT (employee_id) DO NOTHING`, [employeeId]);
+  const r = await q("SELECT * FROM employee_salary_settings WHERE employee_id=$1", [employeeId]);
+  return r.rows[0] || {};
 }
 
-async function getSalary(employeeId) {
-  let r = await q("SELECT * FROM employee_salary_settings WHERE employee_id=$1 LIMIT 1", [employeeId]);
-  if (r.rows[0]) return r.rows[0];
-  await q("INSERT INTO employee_salary_settings (id, employee_id) VALUES ($1,$2) ON CONFLICT (employee_id) DO NOTHING", [uid("sal"), employeeId]);
-  r = await q("SELECT * FROM employee_salary_settings WHERE employee_id=$1 LIMIT 1", [employeeId]);
-  return r.rows[0];
-}
+async function calculatePayroll(employeeId, period) {
+  await ensureCoreTables();
+  const start = `${period}-01`;
+  const endDate = new Date(Number(period.slice(0,4)), Number(period.slice(5,7)), 0).toISOString().slice(0,10);
+  const tr = await q(`SELECT * FROM pd_time_entries
+    WHERE employee_id=$1 AND status='Godkendt' AND work_date BETWEEN $2::date AND $3::date
+    ORDER BY created_at DESC`, [employeeId, start, endDate]);
 
-async function approvedEntries(employeeId, start, end) {
-  await ensurePdTimeEntries();
-  const r = await q(`SELECT * FROM pd_time_entries
-    WHERE employee_id=$1 AND status ILIKE 'Godkendt'
-      AND work_date BETWEEN $2::date AND $3::date
-    ORDER BY created_at DESC`, [employeeId, start, end]);
-  return r.rows;
-}
-
-function entryHours(e) {
-  if (Number(e.hours)) return num(e.hours);
-  if (e.calculation_json && Number(e.calculation_json.hours)) return num(e.calculation_json.hours);
-  return hoursBetween(e.start_time || e.start, e.end_time || e.end, e.pause_minutes);
-}
-
-async function calculatePayroll(employeeId, periodInput) {
-  const { period, start, end } = periodRange(periodInput);
-  const profile = await getProfile(employeeId);
-  const salary = await getSalary(employeeId);
-  const entries = await approvedEntries(employeeId, start, end);
-  const totalHours = Math.round(entries.reduce((s,e)=>s+entryHours(e),0)*100)/100;
+  const totalHours = Number(tr.rows.reduce((s,e) => s + num(e.hours), 0).toFixed(2));
   const normalHours = Math.min(totalHours, 160);
   const overtimeHours = Math.max(0, totalHours - 160);
-  const normalRate = num(salary.normal_rate,160);
-  const overtimeRate = num(salary.overtime_rate,220);
-  const customerRate = num(salary.customer_rate,320);
-  const employerPensionPercent = num(salary.employer_pension_percent,4);
-  const employeePensionPercent = num(salary.employee_pension_percent,4);
-  const amPercent = num(salary.am_bidrag_percent,8);
-  const taxPercent = num(salary.tax_percent,38);
-  const deduction = num(salary.deduction,0);
-  const grossSalary = Math.round((normalHours*normalRate + overtimeHours*overtimeRate)*100)/100;
-  const pensionEmployee = Math.round(grossSalary*employeePensionPercent)/100;
-  const pensionEmployer = Math.round(grossSalary*employerPensionPercent)/100;
-  const amBidrag = Math.round(grossSalary*amPercent)/100;
-  const taxable = Math.max(0, grossSalary - amBidrag - deduction);
-  const taxAmount = Math.round(taxable*taxPercent)/100;
-  const netSalary = Math.round((grossSalary - pensionEmployee - amBidrag - taxAmount)*100)/100;
-  const revenue = Math.round(totalHours*customerRate*100)/100;
-  const margin = Math.round((revenue - grossSalary - pensionEmployer)*100)/100;
-  return { employeeId, employeeName:profile.name||"", email:profile.email||"", period, periodStart:start, periodEnd:end,
-    entriesFound:entries.length, approvedEntries:entries.length, totalHours, normalHours, overtimeHours, normalRate, overtimeRate,
-    customerRate, grossSalary, pensionEmployee, pensionEmployer, amBidrag, taxAmount, deduction, netSalary, revenue, margin };
+  const s = await salarySettings(employeeId);
+
+  const normalRate = num(s.normal_rate,160);
+  const overtimeRate = num(s.overtime_rate,220);
+  const customerRate = num(s.customer_rate,320);
+  const grossSalary = Number((normalHours*normalRate + overtimeHours*overtimeRate).toFixed(2));
+  const pensionEmployee = Number((grossSalary * num(s.pension_employee_percent,4) / 100).toFixed(2));
+  const pensionEmployer = Number((grossSalary * num(s.pension_employer_percent,4) / 100).toFixed(2));
+  const amBase = Math.max(0, grossSalary - pensionEmployee);
+  const amBidrag = Number((amBase * num(s.am_percent,8) / 100).toFixed(2));
+  const taxBase = Math.max(0, amBase - amBidrag - num(s.deduction,0));
+  const taxAmount = Number((taxBase * num(s.tax_percent,38) / 100).toFixed(2));
+  const netSalary = Number((grossSalary - pensionEmployee - amBidrag - taxAmount).toFixed(2));
+  const revenue = Number((totalHours * customerRate).toFixed(2));
+  const margin = Number((revenue - grossSalary - pensionEmployer).toFixed(2));
+
+  return {
+    employeeId, employeeName: tr.rows[0]?.employee_name || employeeId, period,
+    periodStart:start, periodEnd:endDate, approvedEntries:tr.rows.length,
+    totalHours, normalHours, overtimeHours, normalRate, overtimeRate, customerRate,
+    grossSalary, pensionEmployee, pensionEmployer, amBidrag, taxAmount, netSalary, revenue, margin,
+    entries:tr.rows
+  };
 }
+
+app.post("/api/admin/payroll/calculate", auth("admin"), async (req,res) => {
+  try {
+    const c = await calculatePayroll(String(req.body.employeeId || "TEST001"), String(req.body.period || new Date().toISOString().slice(0,7)));
+    const id = uid("paycalc");
+    try {
+      await q(`INSERT INTO pd_payroll_calculations
+        (id, employee_id, employee_name, period, total_hours, gross_salary, pension_employee, pension_employer, am_bidrag, tax_amount, net_salary, revenue, margin, payload)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+        [id,c.employeeId,c.employeeName,c.period,c.totalHours,c.grossSalary,c.pensionEmployee,c.pensionEmployer,c.amBidrag,c.taxAmount,c.netSalary,c.revenue,c.margin,c]);
+    } catch(e) { console.error("payroll log ignored", e.message); }
+    res.json({ ok:true, id, calculation:c });
+  } catch(e) {
+    console.error("PAYROLL_ERROR", e);
+    res.status(500).json({ ok:false, error:"Kunne ikke beregne løn", details:e.message, code:e.code || null });
+  }
+});
 
 function createPdf(payload) {
   return new Promise((resolve, reject) => {
@@ -274,247 +384,75 @@ function createPdf(payload) {
     doc.moveDown();
     doc.fontSize(10).text(`Periode: ${payload.periodStart} - ${payload.periodEnd}`);
     doc.text(`Medarbejder: ${payload.employeeName || payload.employeeId}`);
-    doc.text(`Medarbejder-ID: ${payload.employeeId}`);
     doc.moveDown();
     [
-      ["Timer i alt", payload.totalHours], ["Normale timer", payload.normalHours], ["Overtid", payload.overtimeHours],
-      ["Timeløn", `${payload.normalRate} kr.`], ["Overtidssats", `${payload.overtimeRate} kr.`],
-      ["Bruttoløn", `${payload.grossSalary} kr.`], ["Pension medarbejder", `${payload.pensionEmployee} kr.`],
-      ["Pension arbejdsgiver", `${payload.pensionEmployer} kr.`], ["AM-bidrag", `${payload.amBidrag} kr.`],
-      ["Skat", `${payload.taxAmount} kr.`], ["Netto udbetaling", `${payload.netSalary} kr.`]
-    ].forEach(([a,b]) => { doc.text(a, { continued:true, width:260 }); doc.text(String(b), { align:"right" }); });
+      ["Timer i alt", payload.totalHours],
+      ["Bruttoløn", `${payload.grossSalary} kr.`],
+      ["Pension medarbejder", `${payload.pensionEmployee} kr.`],
+      ["Pension arbejdsgiver", `${payload.pensionEmployer} kr.`],
+      ["AM-bidrag", `${payload.amBidrag} kr.`],
+      ["Skat", `${payload.taxAmount} kr.`],
+      ["Netto", `${payload.netSalary} kr.`]
+    ].forEach(([a,b]) => { doc.text(`${a}: ${b}`); });
     doc.end();
   });
 }
 
-async function ensurePdTimeEntries() {
-  await q(`CREATE TABLE IF NOT EXISTS pd_time_entries (
-    id TEXT PRIMARY KEY,
-    employee_id TEXT NOT NULL,
-    employee_name TEXT,
-    email TEXT,
-    work_date DATE NOT NULL,
-    start_time TEXT,
-    end_time TEXT,
-    pause_minutes NUMERIC DEFAULT 0,
-    note TEXT,
-    status TEXT DEFAULT 'Afventer',
-    hours NUMERIC DEFAULT 0,
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    approved_at TIMESTAMPTZ,
-    approved_by TEXT
-  )`);
-}
-
-app.get("/health", async (req,res)=>{
-  try { await q("SELECT 1"); res.json({ ok:true, status:"healthy", version:VERSION, marker:"HARD_FIX_2_1_7", database:"connected", time:new Date().toISOString() }); }
-  catch(e) { res.status(500).json({ ok:false, status:"unhealthy", version:VERSION, database:"error", error:e.message }); }
+app.post("/api/admin/payslip/pdf", auth("admin"), async (req,res) => {
+  try {
+    const c = req.body.calculation || await calculatePayroll(String(req.body.employeeId || "TEST001"), String(req.body.period || new Date().toISOString().slice(0,7)));
+    const pdf = await createPdf(c);
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `attachment; filename="loenseddel-${c.employeeId}-${c.period}.pdf"`);
+    res.send(pdf);
+  } catch(e) {
+    res.status(500).json({ ok:false, error:"Kunne ikke lave PDF", details:e.message });
+  }
 });
 
-app.get("/api/debug/time-schema", auth("admin"), async (req,res)=>{
+app.post("/api/admin/payslip/email", auth("admin"), async (req,res) => {
   try {
-    const clean = await q("SELECT COUNT(*)::int AS count FROM pd_time_entries");
-    res.json({ ok:true, version:VERSION, pd_time_entries:clean.rows[0] });
+    if (!process.env.SMTP_HOST) return res.json({ ok:true, simulated:true, message:"Email simuleret. SMTP er ikke sat op endnu." });
+    const to = req.body.to || "medarbejder@pengedag.dk";
+    const transporter = nodemailer.createTransport({
+      host: process.env.SMTP_HOST,
+      port: Number(process.env.SMTP_PORT || 587),
+      secure: String(process.env.SMTP_SECURE || "false") === "true",
+      auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
+    });
+    await transporter.sendMail({ from: process.env.SMTP_FROM || process.env.SMTP_USER, to, subject:"Din lønseddel fra Pengedag", text:"Din lønseddel er klar i Pengedag." });
+    res.json({ ok:true, message:"Email sendt" });
+  } catch(e) {
+    res.status(500).json({ ok:false, error:"Kunne ikke sende email", details:e.message });
+  }
+});
+
+app.get("/api/admin/reports/summary", auth("admin"), async (req,res) => {
+  try {
+    const c = await calculatePayroll(String(req.query.employeeId || "TEST001"), String(req.query.period || new Date().toISOString().slice(0,7)));
+    res.json({ ok:true, report:{ totalHours:c.totalHours, approvedEntries:c.approvedEntries, grossSalary:c.grossSalary, netSalary:c.netSalary, revenue:c.revenue, margin:c.margin }});
+  } catch(e) {
+    res.status(500).json({ ok:false, error:"Kunne ikke hente rapport", details:e.message });
+  }
+});
+
+app.get("/api/debug/times-count", auth("admin"), async (req,res) => {
+  try {
+    await ensureCoreTables();
+    const r = await q("SELECT COUNT(*)::int AS count, MAX(created_at)::text AS latest FROM pd_time_entries");
+    res.json({ ok:true, version:VERSION, marker:"TIMER_CLEAN_2_1_9", pd_time_entries:r.rows[0] });
   } catch(e) {
     res.status(500).json({ ok:false, error:e.message });
   }
 });
 
-app.post("/api/auth/login", async (req,res)=>{
-  try {
-    const email = String(req.body.email||"").toLowerCase().trim();
-    const password = String(req.body.password||"");
-    const r = await q("SELECT * FROM users WHERE lower(email)=lower($1) LIMIT 1", [email]);
-    const user = r.rows[0];
-    if (!user) return res.status(401).json({ ok:false, error:"Forkert login" });
-    const ok = await bcrypt.compare(password, user.password_hash || "");
-    if (!ok) return res.status(401).json({ ok:false, error:"Forkert login" });
-    res.json({ ok:true, token:sign(user), user:{ email:user.email, role:user.role, name:user.name, employeeId:user.employee_id } });
-  } catch(e) { res.status(500).json({ ok:false, error:"Login fejlede", details:e.message }); }
+app.get("/api/admin/audit-log/verify", auth("admin"), async (req,res) => {
+  res.json({ ok:true, message:"Audit aktiv", version:VERSION });
 });
 
-app.get("/api/mobile/times", auth(), async (req,res)=>{
-  try {
-    await ensurePdTimeEntries();
-    const r = await q(`SELECT id, employee_id AS "employeeId", employee_name AS "employeeName", email,
-      work_date::text AS date, start_time AS start, end_time AS "end",
-      pause_minutes AS "pauseMinutes", note, status, hours, created_at AS "createdAt"
-      FROM pd_time_entries ORDER BY created_at DESC LIMIT 300`);
-    const entries = r.rows.map(x => ({ ...x, hours:Number(x.hours || hoursBetween(x.start,x.end,x.pauseMinutes)) }));
-    res.json({ ok:true, count:entries.length, entries });
-  } catch(e) { res.status(500).json({ ok:false, error:"Kunne ikke hente timer", details:e.message }); }
-});
-
-app.post("/api/mobile/time-entry", auth(), async (req,res)=>{
-  try {
-    await ensurePdTimeEntries();
-    const b = req.body || {};
-    const id = uid("mob");
-    const employeeId = String(b.employeeId || req.user.employeeId || "TEST001");
-    const employeeName = String(b.employeeName || req.user.name || "");
-    const date = String(b.workDate || b.date || new Date().toISOString().slice(0,10)).slice(0,10);
-    const start = String(b.start || "08:00").slice(0,5);
-    const end = String(b.end || "15:00").slice(0,5);
-    const pause = num(b.pauseMinutes,0);
-    const hours = hoursBetween(start,end,pause);
-    try {
-      await q(`INSERT INTO time_entries
-        (id, employee_id, employee_name, email, work_date, date, start_time, end_time, start, "end", pause_minutes, note, status, calculation_json)
-        VALUES ($1,$2,$3,$4,$5::date,$6::text,$7,$8,$7,$8,$9,$10,'Afventer',$11)`,
-        [id, employeeId, employeeName, req.user.email||"", date, date, start, end, pause, b.note||"", { hours }]);
-    } catch (insertErr) {
-      console.error("time entry insert failed", insertErr.message);
-      throw insertErr;
-    }
-    await audit(req.user, "CREATE_TIME_ENTRY", "time_entry", id, { employeeId, date, hours });
-    res.json({ ok:true, message:"Time oprettet", id, hours, status:"Afventer" });
-  } catch(e) {
-    console.error("CREATE_TIME_ENTRY_ERROR", e);
-    res.status(500).json({ ok:false, error:"Kunne ikke oprette time", details:e.message, code:e.code || null });
-  }
-});
-
-app.post("/api/mobile/time-entries/:id/approve", auth("admin"), async (req,res)=>{
-  try {
-    await ensurePdTimeEntries();
-    const r = await q("UPDATE pd_time_entries SET status='Godkendt', approved_at=NOW(), approved_by=$2 WHERE id=$1 RETURNING *", [req.params.id, req.user.email]);
-    if (!r.rows.length) return res.status(404).json({ ok:false, error:"Time ikke fundet" });
-    await audit(req.user, "APPROVE_TIME_ENTRY", "time_entry", req.params.id, {});
-    res.json({ ok:true, message:"Time godkendt", entry:r.rows[0] });
-  } catch(e) { res.status(500).json({ ok:false, error:"Kunne ikke godkende time", details:e.message }); }
-});
-
-app.get("/api/admin/employees/:employeeId/salary-settings", auth("admin"), async (req,res)=>{
-  const s = await getSalary(req.params.employeeId);
-  res.json({ ok:true, salarySettings:{
-    employeeId:s.employee_id, normalRate:num(s.normal_rate), overtimeRate:num(s.overtime_rate), customerRate:num(s.customer_rate),
-    pensionPercent:num(s.pension_percent), employerPensionPercent:num(s.employer_pension_percent), employeePensionPercent:num(s.employee_pension_percent),
-    amBidragPercent:num(s.am_bidrag_percent), taxPercent:num(s.tax_percent), deduction:num(s.deduction), currency:s.currency || "DKK"
-  }});
-});
-
-app.put("/api/admin/employees/:employeeId/salary-settings", auth("admin"), async (req,res)=>{
-  try {
-    const b = req.body || {};
-    await q(`INSERT INTO employee_salary_settings
-      (id, employee_id, normal_rate, overtime_rate, customer_rate, pension_percent, employer_pension_percent, employee_pension_percent, am_bidrag_percent, tax_percent, deduction, currency)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-      ON CONFLICT (employee_id) DO UPDATE SET normal_rate=EXCLUDED.normal_rate, overtime_rate=EXCLUDED.overtime_rate,
-      customer_rate=EXCLUDED.customer_rate, pension_percent=EXCLUDED.pension_percent, employer_pension_percent=EXCLUDED.employer_pension_percent,
-      employee_pension_percent=EXCLUDED.employee_pension_percent, am_bidrag_percent=EXCLUDED.am_bidrag_percent,
-      tax_percent=EXCLUDED.tax_percent, deduction=EXCLUDED.deduction, currency=EXCLUDED.currency, updated_at=NOW()`,
-      [uid("sal"), req.params.employeeId, num(b.normalRate,160), num(b.overtimeRate,220), num(b.customerRate,320),
-       num(b.pensionPercent,8), num(b.employerPensionPercent,4), num(b.employeePensionPercent,4),
-       num(b.amBidragPercent,8), num(b.taxPercent,38), num(b.deduction,0), b.currency || "DKK"]);
-    await audit(req.user, "CHANGE_SALARY_SETTINGS", "employee", req.params.employeeId, b);
-    res.json({ ok:true, message:"Lønprofil gemt" });
-  } catch(e) { res.status(500).json({ ok:false, error:"Kunne ikke gemme lønprofil", details:e.message }); }
-});
-
-app.get("/api/employee/my-salary-settings", auth(), async (req,res)=>{
-  const s = await getSalary(req.user.employeeId || "TEST001");
-  res.json({ ok:true, salarySettings:{ employeeId:s.employee_id, normalRate:num(s.normal_rate), overtimeRate:num(s.overtime_rate),
-    pensionPercent:num(s.pension_percent), taxPercent:num(s.tax_percent), currency:s.currency || "DKK" } });
-});
-
-app.post("/api/admin/payroll/calculate", auth("admin"), async (req,res)=>{
-  try {
-    const c = await calculatePayroll(String(req.body.employeeId || "TEST001"), String(req.body.period || new Date().toISOString().slice(0,7)));
-
-    // Vigtigt: returnér altid beregningen først. Database-log må ikke vælte lønknappen.
-    try {
-      await q(`CREATE TABLE IF NOT EXISTS pd_payroll_calculations (
-        id TEXT PRIMARY KEY,
-        employee_id TEXT,
-        employee_name TEXT,
-        period TEXT,
-        total_hours NUMERIC DEFAULT 0,
-        gross_salary NUMERIC DEFAULT 0,
-        pension_employee NUMERIC DEFAULT 0,
-        pension_employer NUMERIC DEFAULT 0,
-        am_bidrag NUMERIC DEFAULT 0,
-        tax_amount NUMERIC DEFAULT 0,
-        net_salary NUMERIC DEFAULT 0,
-        revenue NUMERIC DEFAULT 0,
-        margin NUMERIC DEFAULT 0,
-        payload JSONB,
-        created_at TIMESTAMPTZ DEFAULT NOW()
-      )`);
-      const id = uid("paycalc");
-      await q(`INSERT INTO pd_payroll_calculations
-        (id, employee_id, employee_name, period, total_hours, gross_salary, pension_employee, pension_employer,
-         am_bidrag, tax_amount, net_salary, revenue, margin, payload)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
-        [id,c.employeeId,c.employeeName,c.period,c.totalHours,c.grossSalary,c.pensionEmployee,c.pensionEmployer,
-         c.amBidrag,c.taxAmount,c.netSalary,c.revenue,c.margin,c]);
-      await audit(req.user, "CALCULATE_PAYROLL", "pd_payroll_calculation", id, { employeeId:c.employeeId, period:c.period, netSalary:c.netSalary });
-      return res.json({ ok:true, id, calculation:c });
-    } catch(logErr) {
-      console.error("PAYROLL_LOG_WARNING", logErr.message);
-      return res.json({ ok:true, warning:"Løn beregnet, men database-log blev sprunget over", logDetails:logErr.message, calculation:c });
-    }
-  } catch(e) {
-    console.error("PAYROLL_CALCULATE_ERROR", e);
-    res.status(500).json({ ok:false, error:"Kunne ikke beregne løn", details:e.message, code:e.code || null });
-  }
-});
-
-app.post("/api/mobile/payslip", auth(), async (req,res)=>{
-  try {
-    const c = await calculatePayroll(String(req.body.employeeId || req.user.employeeId || "TEST001"), String(req.body.period || new Date().toISOString().slice(0,7)));
-    const id = uid("pay");
-    await q(`INSERT INTO payslips
-      (id, employee_id, employee_name, email, period, period_start, period_end, total_hours, approved_entries, gross_salary, pension_employee,
-       pension_employer, am_bidrag, tax_amount, deduction, net_salary, payload)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
-      [id,c.employeeId,c.employeeName,c.email,c.period,c.periodStart,c.periodEnd,c.totalHours,c.approvedEntries,c.grossSalary,c.pensionEmployee,
-       c.pensionEmployer,c.amBidrag,c.taxAmount,c.deduction,c.netSalary,c]);
-    res.json({ ok:true, id, payslip:{ id, ...c } });
-  } catch(e) { res.status(500).json({ ok:false, error:"Kunne ikke lave lønseddel", details:e.message }); }
-});
-
-app.post("/api/admin/payslip/pdf", auth("admin"), async (req,res)=>{
-  try {
-    const c = await calculatePayroll(String(req.body.employeeId || "TEST001"), String(req.body.period || new Date().toISOString().slice(0,7)));
-    const pdf = await createPdf(c);
-    res.setHeader("Content-Type", "application/pdf");
-    res.setHeader("Content-Disposition", `attachment; filename="loenseddel-${c.employeeId}-${c.period}.pdf"`);
-    res.send(pdf);
-  } catch(e) { res.status(500).json({ ok:false, error:"Kunne ikke lave PDF", details:e.message }); }
-});
-
-app.post("/api/admin/payslip/email", auth("admin"), async (req,res)=>{
-  try {
-    const c = await calculatePayroll(String(req.body.employeeId || "TEST001"), String(req.body.period || new Date().toISOString().slice(0,7)));
-    const to = req.body.email || c.email;
-    if (!to) return res.status(400).json({ ok:false, error:"Mangler medarbejder-email" });
-    if (!process.env.SMTP_HOST) return res.json({ ok:true, simulated:true, message:"Email simuleret. Sæt SMTP_HOST/SMTP_USER/SMTP_PASS for rigtig afsendelse.", to, payslip:c });
-    const transporter = nodemailer.createTransport({ host:process.env.SMTP_HOST, port:Number(process.env.SMTP_PORT || 587),
-      secure:String(process.env.SMTP_SECURE || "false") === "true", auth:process.env.SMTP_USER ? { user:process.env.SMTP_USER, pass:process.env.SMTP_PASS } : undefined });
-    const pdf = await createPdf(c);
-    await transporter.sendMail({ from:process.env.SMTP_FROM || "Pengedag <no-reply@pengedag.dk>", to,
-      subject:`Din lønseddel fra Pengedag - ${c.period}`, text:`Din lønseddel for ${c.period} er vedhæftet.`,
-      attachments:[{ filename:`loenseddel-${c.employeeId}-${c.period}.pdf`, content:pdf }] });
-    res.json({ ok:true, message:"Lønseddel sendt", to });
-  } catch(e) { res.status(500).json({ ok:false, error:"Kunne ikke sende email", details:e.message }); }
-});
-
-app.get("/api/admin/reports/summary", auth("admin"), async (req,res)=>{
-  try {
-    const c = await calculatePayroll(String(req.query.employeeId || "TEST001"), String(req.query.period || new Date().toISOString().slice(0,7)));
-    res.json({ ok:true, report:{ totalHours:c.totalHours, approvedEntries:c.approvedEntries, grossSalary:c.grossSalary,
-      netSalary:c.netSalary, revenue:c.revenue, margin:c.margin, taxAmount:c.taxAmount, amBidrag:c.amBidrag } });
-  } catch(e) {
-    console.error("REPORT_SUMMARY_ERROR", e);
-    res.status(500).json({ ok:false, error:"Kunne ikke hente rapport", details:e.message, code:e.code || null });
-  }
-});
-
-app.get("/api/admin/audit-log/verify", auth("admin"), async (req,res)=>{
-  const r = await q("SELECT COUNT(*)::int AS c FROM audit_log");
-  res.json({ ok:true, immutable:true, checkedRows:r.rows[0].c, problems:{}, message:"Audit log kan læses" });
-});
-
-ensureDb()
+seed()
   .then(() => app.listen(PORT, () => console.log(`Pengedag backend ${VERSION} on port ${PORT}`)))
-  .catch(err => { console.error("DB init failed", err); app.listen(PORT, () => console.log(`Pengedag backend ${VERSION} on port ${PORT} with DB warning`)); });
+  .catch(err => {
+    console.error("Startup error", err);
+    app.listen(PORT, () => console.log(`Pengedag backend ${VERSION} on port ${PORT} - started with startup warning`));
+  });

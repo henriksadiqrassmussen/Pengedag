@@ -1,17 +1,16 @@
 {
-  "name": "pengedag-v2-combined-times-visibility-fix",
-  "version": "2.1.8",
-  "main": "server.js",
+  "name": "pengedag-v2-timer-clean-working",
+  "version": "2.1.9",
+  "type": "module",
   "scripts": {
-    "start": "node server.js",
-    "check": "node --check server.js"
+    "start": "node server.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
     "cors": "^2.8.5",
-    "express": "^4.19.2",
+    "express": "^4.18.2",
     "jsonwebtoken": "^9.0.2",
-    "nodemailer": "^6.9.14",
+    "nodemailer": "^6.9.13",
     "pdfkit": "^0.15.0",
     "pg": "^8.12.0"
   }
