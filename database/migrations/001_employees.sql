@@ -1,1 +1,0 @@
-CREATE TABLE IF NOT EXISTS employees (id TEXT PRIMARY KEY, name TEXT DEFAULT '', type TEXT DEFAULT 'Vikar');
