@@ -1,1 +1,0 @@
-NY API route: medarbejdere
