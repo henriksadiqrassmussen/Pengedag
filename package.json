@@ -1,6 +1,6 @@
 {
-  "name": "pengedag-v2-hard-server-fix",
-  "version": "2.1.7",
+  "name": "pengedag-v2-combined-times-visibility-fix",
+  "version": "2.1.8",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
