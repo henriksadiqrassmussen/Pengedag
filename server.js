@@ -9,7 +9,7 @@ const nodemailer = require("nodemailer");
 
 const app = express();
 const PORT = process.env.PORT || 8080;
-const VERSION = "2.1.1-payroll-pdf-email-reports";
+const VERSION = "2.1.2-schema-safe-time-entry-fix";
 
 const JWT_SECRET = process.env.JWT_SECRET || "pengedag-local-secret";
 const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || "vault1973@gmail.com").toLowerCase();
@@ -61,6 +61,33 @@ async function audit(user, action, targetType, targetId, details={}) {
   } catch (e) { console.error("audit failed", e.message); }
 }
 
+async function ensureColumn(tableName, columnName, sqlType) {
+  const table = String(tableName).replace(/"/g, '""');
+  const column = String(columnName).replace(/"/g, '""');
+  await q(`ALTER TABLE "${table}" ADD COLUMN IF NOT EXISTS "${column}" ${sqlType}`);
+}
+
+async function ensureTimeEntryColumns() {
+  await ensureColumn("time_entries", "employee_id", "TEXT");
+  await ensureColumn("time_entries", "employee_name", "TEXT");
+  await ensureColumn("time_entries", "email", "TEXT");
+  await ensureColumn("time_entries", "customer_id", "TEXT");
+  await ensureColumn("time_entries", "customer_name", "TEXT");
+  await ensureColumn("time_entries", "work_date", "DATE");
+  await ensureColumn("time_entries", "date", "TEXT");
+  await ensureColumn("time_entries", "start_time", "TEXT");
+  await ensureColumn("time_entries", "end_time", "TEXT");
+  await ensureColumn("time_entries", "start", "TEXT");
+  await ensureColumn("time_entries", "end", "TEXT");
+  await ensureColumn("time_entries", "pause_minutes", "NUMERIC DEFAULT 0");
+  await ensureColumn("time_entries", "note", "TEXT");
+  await ensureColumn("time_entries", "status", "TEXT DEFAULT 'Afventer'");
+  await ensureColumn("time_entries", "calculation_json", "JSONB");
+  await ensureColumn("time_entries", "created_at", "TIMESTAMPTZ DEFAULT NOW()");
+  await ensureColumn("time_entries", "approved_at", "TIMESTAMPTZ");
+  await ensureColumn("time_entries", "approved_by", "TEXT");
+}
+
 async function seedUser(email, password, role, name, employeeId) {
   const found = await q("SELECT id FROM users WHERE lower(email)=lower($1) LIMIT 1", [email]);
   if (found.rows.length) return;
@@ -90,6 +117,7 @@ async function ensureDb() {
     note TEXT, status TEXT DEFAULT 'Afventer', calculation_json JSONB, created_at TIMESTAMPTZ DEFAULT NOW(),
     approved_at TIMESTAMPTZ, approved_by TEXT
   )`);
+  await ensureTimeEntryColumns();
   await q(`CREATE TABLE IF NOT EXISTS payroll_calculations (
     id TEXT PRIMARY KEY, employee_id TEXT, employee_name TEXT, period TEXT, period_start DATE, period_end DATE,
     normal_hours NUMERIC DEFAULT 0, overtime_hours NUMERIC DEFAULT 0, total_hours NUMERIC DEFAULT 0,
@@ -266,10 +294,15 @@ app.post("/api/mobile/time-entry", auth(), async (req,res)=>{
     const end = String(b.end || "15:00").slice(0,5);
     const pause = num(b.pauseMinutes,0);
     const hours = hoursBetween(start,end,pause);
-    await q(`INSERT INTO time_entries
-      (id, employee_id, employee_name, email, work_date, date, start_time, end_time, start, "end", pause_minutes, note, status, calculation_json)
-      VALUES ($1,$2,$3,$4,$5,$5,$6,$7,$6,$7,$8,$9,'Afventer',$10)`,
-      [id, employeeId, employeeName, req.user.email||"", date, start, end, pause, b.note||"", { hours }]);
+    try {
+      await q(`INSERT INTO time_entries
+        (id, employee_id, employee_name, email, work_date, date, start_time, end_time, start, "end", pause_minutes, note, status, calculation_json)
+        VALUES ($1,$2,$3,$4,$5,$5,$6,$7,$6,$7,$8,$9,'Afventer',$10)`,
+        [id, employeeId, employeeName, req.user.email||"", date, start, end, pause, b.note||"", { hours }]);
+    } catch (insertErr) {
+      console.error("time entry insert failed", insertErr.message);
+      throw insertErr;
+    }
     await audit(req.user, "CREATE_TIME_ENTRY", "time_entry", id, { employeeId, date, hours });
     res.json({ ok:true, message:"Time oprettet", id, hours, status:"Afventer" });
   } catch(e) { res.status(500).json({ ok:false, error:"Kunne ikke oprette time", details:e.message }); }
