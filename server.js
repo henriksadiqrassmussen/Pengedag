@@ -118,6 +118,23 @@ async function ensureDb() {
     approved_at TIMESTAMPTZ, approved_by TEXT
   )`);
   await ensureTimeEntryColumns();
+
+  await q(`CREATE TABLE IF NOT EXISTS pd_time_entries (
+    id TEXT PRIMARY KEY,
+    employee_id TEXT NOT NULL,
+    employee_name TEXT,
+    email TEXT,
+    work_date DATE NOT NULL,
+    start_time TEXT,
+    end_time TEXT,
+    pause_minutes NUMERIC DEFAULT 0,
+    note TEXT,
+    status TEXT DEFAULT 'Afventer',
+    hours NUMERIC DEFAULT 0,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    approved_at TIMESTAMPTZ,
+    approved_by TEXT
+  )`);
   await q(`CREATE TABLE IF NOT EXISTS payroll_calculations (
     id TEXT PRIMARY KEY, employee_id TEXT, employee_name TEXT, period TEXT, period_start DATE, period_end DATE,
     normal_hours NUMERIC DEFAULT 0, overtime_hours NUMERIC DEFAULT 0, total_hours NUMERIC DEFAULT 0,
@@ -186,15 +203,15 @@ async function getSalary(employeeId) {
 }
 
 async function approvedEntries(employeeId, start, end) {
-  const r = await q(`SELECT * FROM time_entries
+  const r = await q(`SELECT * FROM pd_time_entries
     WHERE employee_id=$1 AND status ILIKE 'Godkendt'
-    AND ((work_date IS NOT NULL AND work_date BETWEEN $2::date AND $3::date)
-      OR (date ~ '^\\d{4}-\\d{2}-\\d{2}$' AND date::date BETWEEN $2::date AND $3::date))
+      AND work_date BETWEEN $2::date AND $3::date
     ORDER BY created_at DESC`, [employeeId, start, end]);
   return r.rows;
 }
 
 function entryHours(e) {
+  if (Number(e.hours)) return num(e.hours);
   if (e.calculation_json && Number(e.calculation_json.hours)) return num(e.calculation_json.hours);
   return hoursBetween(e.start_time || e.start, e.end_time || e.end, e.pause_minutes);
 }
@@ -259,6 +276,15 @@ app.get("/health", async (req,res)=>{
   catch(e) { res.status(500).json({ ok:false, status:"unhealthy", version:VERSION, database:"error", error:e.message }); }
 });
 
+app.get("/api/debug/time-schema", auth("admin"), async (req,res)=>{
+  try {
+    const clean = await q("SELECT COUNT(*)::int AS count FROM pd_time_entries");
+    res.json({ ok:true, version:VERSION, pd_time_entries:clean.rows[0] });
+  } catch(e) {
+    res.status(500).json({ ok:false, error:e.message });
+  }
+});
+
 app.post("/api/auth/login", async (req,res)=>{
   try {
     const email = String(req.body.email||"").toLowerCase().trim();
@@ -275,10 +301,10 @@ app.post("/api/auth/login", async (req,res)=>{
 app.get("/api/mobile/times", auth(), async (req,res)=>{
   try {
     const r = await q(`SELECT id, employee_id AS "employeeId", employee_name AS "employeeName", email,
-      COALESCE(work_date::text,date) AS date, COALESCE(start_time,start) AS start, COALESCE(end_time,"end") AS "end",
-      pause_minutes AS "pauseMinutes", note, status, created_at AS "createdAt"
-      FROM time_entries ORDER BY created_at DESC LIMIT 300`);
-    const entries = r.rows.map(x => ({ ...x, hours:hoursBetween(x.start,x.end,x.pauseMinutes) }));
+      work_date::text AS date, start_time AS start, end_time AS "end",
+      pause_minutes AS "pauseMinutes", note, status, hours, created_at AS "createdAt"
+      FROM pd_time_entries ORDER BY created_at DESC LIMIT 300`);
+    const entries = r.rows.map(x => ({ ...x, hours:Number(x.hours || hoursBetween(x.start,x.end,x.pauseMinutes)) }));
     res.json({ ok:true, count:entries.length, entries });
   } catch(e) { res.status(500).json({ ok:false, error:"Kunne ikke hente timer", details:e.message }); }
 });
@@ -310,7 +336,7 @@ app.post("/api/mobile/time-entry", auth(), async (req,res)=>{
 
 app.post("/api/mobile/time-entries/:id/approve", auth("admin"), async (req,res)=>{
   try {
-    const r = await q("UPDATE time_entries SET status='Godkendt', approved_at=NOW(), approved_by=$2 WHERE id=$1 RETURNING *", [req.params.id, req.user.email]);
+    const r = await q("UPDATE pd_time_entries SET status='Godkendt', approved_at=NOW(), approved_by=$2 WHERE id=$1 RETURNING *", [req.params.id, req.user.email]);
     if (!r.rows.length) return res.status(404).json({ ok:false, error:"Time ikke fundet" });
     await audit(req.user, "APPROVE_TIME_ENTRY", "time_entry", req.params.id, {});
     res.json({ ok:true, message:"Time godkendt", entry:r.rows[0] });
