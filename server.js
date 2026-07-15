@@ -6,7 +6,7 @@ import bcrypt from 'bcryptjs';
 import pkg from 'pg';
 const { Pool } = pkg;
 
-const VERSION = '2.0.1-sprint1-real';
+const VERSION = '2.0.2-sprint1-real-backend-fix';
 const PORT = process.env.PORT || 8080;
 const DATABASE_URL = process.env.DATABASE_URL;
 const JWT_SECRET = process.env.JWT_SECRET || process.env.SESSION_SECRET || 'pengedag-dev-secret-change-me';
@@ -57,9 +57,13 @@ function requireAdmin(req, res, next) {
   if (!['admin', 'owner', 'ejer', 'auditor'].includes(role)) return res.status(403).json({ ok: false, error: 'Kræver ejer/admin' });
   next();
 }
-async function ensureColumn(table, column, type) {
-  await db(`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS ${column} ${type}`);
+function qIdent(name) {
+  return '"' + String(name).replace(/"/g, '""') + '"';
 }
+async function ensureColumn(table, column, type) {
+  await db(`ALTER TABLE ${qIdent(table)} ADD COLUMN IF NOT EXISTS ${qIdent(column)} ${type}`);
+}
+
 async function audit(actor, action, targetType = null, targetId = null, details = {}) {
   try {
     await db(`CREATE TABLE IF NOT EXISTS audit_log (
@@ -242,9 +246,9 @@ async function approvedEntries(employeeId, periodStart, periodEnd) {
       AND lower(coalesce(status,'')) IN ('godkendt','approved')
       AND (
         (work_date IS NOT NULL AND work_date BETWEEN $2::date AND $3::date)
-        OR (NULLIF(date,'') IS NOT NULL AND NULLIF(date,'')::date BETWEEN $2::date AND $3::date)
+        OR (date ~ '^\\d{4}-\\d{2}-\\d{2}$' AND date::date BETWEEN $2::date AND $3::date)
       )
-    ORDER BY COALESCE(work_date, NULLIF(date,'')::date), created_at`;
+    ORDER BY COALESCE(work_date, CASE WHEN date ~ '^\\d{4}-\\d{2}-\\d{2}$' THEN date::date ELSE NULL END), created_at`;
   const r = await db(q, [employeeId, periodStart, periodEnd]);
   return r.rows.map(rowToEntry);
 }
