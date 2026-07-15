@@ -203,6 +203,7 @@ async function getSalary(employeeId) {
 }
 
 async function approvedEntries(employeeId, start, end) {
+  await ensurePdTimeEntries();
   const r = await q(`SELECT * FROM pd_time_entries
     WHERE employee_id=$1 AND status ILIKE 'Godkendt'
       AND work_date BETWEEN $2::date AND $3::date
@@ -271,6 +272,25 @@ function createPdf(payload) {
   });
 }
 
+async function ensurePdTimeEntries() {
+  await q(`CREATE TABLE IF NOT EXISTS pd_time_entries (
+    id TEXT PRIMARY KEY,
+    employee_id TEXT NOT NULL,
+    employee_name TEXT,
+    email TEXT,
+    work_date DATE NOT NULL,
+    start_time TEXT,
+    end_time TEXT,
+    pause_minutes NUMERIC DEFAULT 0,
+    note TEXT,
+    status TEXT DEFAULT 'Afventer',
+    hours NUMERIC DEFAULT 0,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    approved_at TIMESTAMPTZ,
+    approved_by TEXT
+  )`);
+}
+
 app.get("/health", async (req,res)=>{
   try { await q("SELECT 1"); res.json({ ok:true, status:"healthy", version:VERSION, database:"connected", time:new Date().toISOString() }); }
   catch(e) { res.status(500).json({ ok:false, status:"unhealthy", version:VERSION, database:"error", error:e.message }); }
@@ -300,6 +320,7 @@ app.post("/api/auth/login", async (req,res)=>{
 
 app.get("/api/mobile/times", auth(), async (req,res)=>{
   try {
+    await ensurePdTimeEntries();
     const r = await q(`SELECT id, employee_id AS "employeeId", employee_name AS "employeeName", email,
       work_date::text AS date, start_time AS start, end_time AS "end",
       pause_minutes AS "pauseMinutes", note, status, hours, created_at AS "createdAt"
@@ -311,6 +332,7 @@ app.get("/api/mobile/times", auth(), async (req,res)=>{
 
 app.post("/api/mobile/time-entry", auth(), async (req,res)=>{
   try {
+    await ensurePdTimeEntries();
     const b = req.body || {};
     const id = uid("mob");
     const employeeId = String(b.employeeId || req.user.employeeId || "TEST001");
@@ -331,11 +353,15 @@ app.post("/api/mobile/time-entry", auth(), async (req,res)=>{
     }
     await audit(req.user, "CREATE_TIME_ENTRY", "time_entry", id, { employeeId, date, hours });
     res.json({ ok:true, message:"Time oprettet", id, hours, status:"Afventer" });
-  } catch(e) { res.status(500).json({ ok:false, error:"Kunne ikke oprette time", details:e.message }); }
+  } catch(e) {
+    console.error("CREATE_TIME_ENTRY_ERROR", e);
+    res.status(500).json({ ok:false, error:"Kunne ikke oprette time", details:e.message, code:e.code || null });
+  }
 });
 
 app.post("/api/mobile/time-entries/:id/approve", auth("admin"), async (req,res)=>{
   try {
+    await ensurePdTimeEntries();
     const r = await q("UPDATE pd_time_entries SET status='Godkendt', approved_at=NOW(), approved_by=$2 WHERE id=$1 RETURNING *", [req.params.id, req.user.email]);
     if (!r.rows.length) return res.status(404).json({ ok:false, error:"Time ikke fundet" });
     await audit(req.user, "APPROVE_TIME_ENTRY", "time_entry", req.params.id, {});
