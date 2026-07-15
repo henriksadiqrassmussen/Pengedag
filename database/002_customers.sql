@@ -1,1 +1,0 @@
-CREATE TABLE IF NOT EXISTS customers (id TEXT PRIMARY KEY, company_name TEXT NOT NULL, cvr TEXT DEFAULT '');
