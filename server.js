@@ -9,8 +9,8 @@ import nodemailer from "nodemailer";
 const { Pool } = pkg;
 const app = express();
 
-const VERSION = "2.1.9-timer-clean-working";
-console.log("### PENGEDAG SERVER.JS 2.1.9 TIMER CLEAN WORKING LOADED ###");
+const VERSION = "2.2.0-salary-profile-working";
+console.log("### PENGEDAG SERVER.JS 2.2.0 SALARY PROFILE WORKING LOADED ###");
 
 const PORT = process.env.PORT || 8080;
 const JWT_SECRET = process.env.JWT_SECRET || "pengedag-dev-secret-change-me";
@@ -77,6 +77,17 @@ async function ensureCoreTables() {
     deduction NUMERIC DEFAULT 0,
     updated_at TIMESTAMPTZ DEFAULT NOW()
   )`);
+  await q(`ALTER TABLE employee_salary_settings ADD COLUMN IF NOT EXISTS normal_rate NUMERIC DEFAULT 160`);
+  await q(`ALTER TABLE employee_salary_settings ADD COLUMN IF NOT EXISTS overtime_rate NUMERIC DEFAULT 220`);
+  await q(`ALTER TABLE employee_salary_settings ADD COLUMN IF NOT EXISTS customer_rate NUMERIC DEFAULT 320`);
+  await q(`ALTER TABLE employee_salary_settings ADD COLUMN IF NOT EXISTS pension_percent NUMERIC DEFAULT 8`);
+  await q(`ALTER TABLE employee_salary_settings ADD COLUMN IF NOT EXISTS pension_employer_percent NUMERIC DEFAULT 4`);
+  await q(`ALTER TABLE employee_salary_settings ADD COLUMN IF NOT EXISTS pension_employee_percent NUMERIC DEFAULT 4`);
+  await q(`ALTER TABLE employee_salary_settings ADD COLUMN IF NOT EXISTS am_percent NUMERIC DEFAULT 8`);
+  await q(`ALTER TABLE employee_salary_settings ADD COLUMN IF NOT EXISTS tax_percent NUMERIC DEFAULT 38`);
+  await q(`ALTER TABLE employee_salary_settings ADD COLUMN IF NOT EXISTS deduction NUMERIC DEFAULT 0`);
+  await q(`ALTER TABLE employee_salary_settings ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`);
+
 
   await q(`CREATE TABLE IF NOT EXISTS pd_time_entries (
     id TEXT PRIMARY KEY,
@@ -186,7 +197,7 @@ app.get("/health", async (req,res) => {
   try {
     await ensureCoreTables();
     await q("SELECT 1");
-    res.json({ ok:true, status:"healthy", version:VERSION, marker:"TIMER_CLEAN_2_1_9", database:"connected", time:new Date().toISOString() });
+    res.json({ ok:true, status:"healthy", version:VERSION, marker:"SALARY_PROFILE_2_2_0", database:"connected", time:new Date().toISOString() });
   } catch(e) {
     res.status(500).json({ ok:false, status:"unhealthy", version:VERSION, error:e.message });
   }
@@ -282,9 +293,30 @@ app.get("/api/admin/employees/:employeeId/salary-settings", auth("admin"), async
     const employeeId = req.params.employeeId;
     await q(`INSERT INTO employee_salary_settings (employee_id) VALUES ($1) ON CONFLICT (employee_id) DO NOTHING`, [employeeId]);
     const r = await q(`SELECT * FROM employee_salary_settings WHERE employee_id=$1`, [employeeId]);
-    res.json({ ok:true, settings:r.rows[0] });
+    const s = r.rows[0] || {};
+    res.json({ ok:true, settings:{
+      employee_id: employeeId,
+      normal_rate: Number(s.normal_rate ?? 160),
+      overtime_rate: Number(s.overtime_rate ?? 220),
+      customer_rate: Number(s.customer_rate ?? 320),
+      pension_percent: Number(s.pension_percent ?? 8),
+      pension_employer_percent: Number(s.pension_employer_percent ?? 4),
+      pension_employee_percent: Number(s.pension_employee_percent ?? 4),
+      am_percent: Number(s.am_percent ?? 8),
+      tax_percent: Number(s.tax_percent ?? 38),
+      deduction: Number(s.deduction ?? 0),
+      normalRate: Number(s.normal_rate ?? 160),
+      overtimeRate: Number(s.overtime_rate ?? 220),
+      customerRate: Number(s.customer_rate ?? 320),
+      pensionPercent: Number(s.pension_percent ?? 8),
+      pensionEmployerPercent: Number(s.pension_employer_percent ?? 4),
+      pensionEmployeePercent: Number(s.pension_employee_percent ?? 4),
+      amPercent: Number(s.am_percent ?? 8),
+      taxPercent: Number(s.tax_percent ?? 38)
+    }});
   } catch(e) {
-    res.status(500).json({ ok:false, error:"Kunne ikke hente lønprofil", details:e.message });
+    console.error("GET_SALARY_SETTINGS_ERROR", e);
+    res.status(500).json({ ok:false, error:"Kunne ikke hente lønprofil", details:e.message, code:e.code || null });
   }
 });
 
@@ -294,22 +326,51 @@ app.put("/api/admin/employees/:employeeId/salary-settings", auth("admin"), async
     const employeeId = req.params.employeeId;
     const b = req.body || {};
     const vals = [
-      employeeId, num(b.normalRate ?? b.normal_rate,160), num(b.overtimeRate ?? b.overtime_rate,220),
-      num(b.customerRate ?? b.customer_rate,320), num(b.pensionPercent ?? b.pension_percent,8),
-      num(b.pensionEmployerPercent ?? b.pension_employer_percent,4), num(b.pensionEmployeePercent ?? b.pension_employee_percent,4),
-      num(b.amPercent ?? b.am_percent,8), num(b.taxPercent ?? b.tax_percent,38), num(b.deduction,0)
+      employeeId,
+      num(b.normalRate ?? b.normal_rate,160),
+      num(b.overtimeRate ?? b.overtime_rate,220),
+      num(b.customerRate ?? b.customer_rate,320),
+      num(b.pensionPercent ?? b.pension_percent,8),
+      num(b.pensionEmployerPercent ?? b.pension_employer_percent,4),
+      num(b.pensionEmployeePercent ?? b.pension_employee_percent,4),
+      num(b.amPercent ?? b.am_percent,8),
+      num(b.taxPercent ?? b.tax_percent,38),
+      num(b.deduction,0)
     ];
+
     await q(`INSERT INTO employee_salary_settings
       (employee_id, normal_rate, overtime_rate, customer_rate, pension_percent, pension_employer_percent, pension_employee_percent, am_percent, tax_percent, deduction, updated_at)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW())
       ON CONFLICT (employee_id) DO UPDATE SET
-        normal_rate=EXCLUDED.normal_rate, overtime_rate=EXCLUDED.overtime_rate, customer_rate=EXCLUDED.customer_rate,
-        pension_percent=EXCLUDED.pension_percent, pension_employer_percent=EXCLUDED.pension_employer_percent,
-        pension_employee_percent=EXCLUDED.pension_employee_percent, am_percent=EXCLUDED.am_percent,
-        tax_percent=EXCLUDED.tax_percent, deduction=EXCLUDED.deduction, updated_at=NOW()`, vals);
-    res.json({ ok:true, message:"Lønprofil gemt" });
+        normal_rate=EXCLUDED.normal_rate,
+        overtime_rate=EXCLUDED.overtime_rate,
+        customer_rate=EXCLUDED.customer_rate,
+        pension_percent=EXCLUDED.pension_percent,
+        pension_employer_percent=EXCLUDED.pension_employer_percent,
+        pension_employee_percent=EXCLUDED.pension_employee_percent,
+        am_percent=EXCLUDED.am_percent,
+        tax_percent=EXCLUDED.tax_percent,
+        deduction=EXCLUDED.deduction,
+        updated_at=NOW()`, vals);
+
+    const r = await q(`SELECT * FROM employee_salary_settings WHERE employee_id=$1`, [employeeId]);
+    res.json({ ok:true, message:"Lønprofil gemt", settings:r.rows[0] });
   } catch(e) {
-    res.status(500).json({ ok:false, error:"Kunne ikke gemme lønprofil", details:e.message });
+    console.error("SAVE_SALARY_SETTINGS_ERROR", e);
+    res.status(500).json({ ok:false, error:"Kunne ikke gemme lønprofil", details:e.message, code:e.code || null });
+  }
+});
+
+
+app.get("/api/employee/my-salary-settings", auth(), async (req,res) => {
+  try {
+    await ensureCoreTables();
+    const employeeId = req.user.employeeId || "TEST001";
+    await q(`INSERT INTO employee_salary_settings (employee_id) VALUES ($1) ON CONFLICT (employee_id) DO NOTHING`, [employeeId]);
+    const r = await q(`SELECT * FROM employee_salary_settings WHERE employee_id=$1`, [employeeId]);
+    res.json({ ok:true, settings:r.rows[0] });
+  } catch(e) {
+    res.status(500).json({ ok:false, error:"Kunne ikke hente min lønprofil", details:e.message, code:e.code || null });
   }
 });
 
@@ -436,11 +497,24 @@ app.get("/api/admin/reports/summary", auth("admin"), async (req,res) => {
   }
 });
 
+
+app.get("/api/debug/salary-settings", auth("admin"), async (req,res) => {
+  try {
+    await ensureCoreTables();
+    const r = await q(`SELECT employee_id, normal_rate, overtime_rate, customer_rate, pension_employee_percent,
+      pension_employer_percent, am_percent, tax_percent, deduction, updated_at
+      FROM employee_salary_settings ORDER BY employee_id LIMIT 50`);
+    res.json({ ok:true, version:VERSION, marker:"SALARY_PROFILE_2_2_0", count:r.rows.length, rows:r.rows });
+  } catch(e) {
+    res.status(500).json({ ok:false, error:e.message, code:e.code || null });
+  }
+});
+
 app.get("/api/debug/times-count", auth("admin"), async (req,res) => {
   try {
     await ensureCoreTables();
     const r = await q("SELECT COUNT(*)::int AS count, MAX(created_at)::text AS latest FROM pd_time_entries");
-    res.json({ ok:true, version:VERSION, marker:"TIMER_CLEAN_2_1_9", pd_time_entries:r.rows[0] });
+    res.json({ ok:true, version:VERSION, marker:"SALARY_PROFILE_2_2_0", pd_time_entries:r.rows[0] });
   } catch(e) {
     res.status(500).json({ ok:false, error:e.message });
   }

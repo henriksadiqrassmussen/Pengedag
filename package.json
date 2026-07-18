@@ -1,6 +1,6 @@
 {
-  "name": "pengedag-v2-timer-clean-working",
-  "version": "2.1.9",
+  "name": "pengedag-v2-salary-profile-working",
+  "version": "2.2.0",
   "type": "module",
   "scripts": {
     "start": "node server.js"
