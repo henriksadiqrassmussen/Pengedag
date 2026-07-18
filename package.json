@@ -1,6 +1,6 @@
 {
-  "name": "pengedag-v2-salary-profile-working",
-  "version": "2.2.0",
+  "name": "pengedag-v2-restore-perfect-ui",
+  "version": "2.2.1",
   "type": "module",
   "scripts": {
     "start": "node server.js"
