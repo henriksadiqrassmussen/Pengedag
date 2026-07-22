@@ -1,6 +1,6 @@
 {
-  "name": "pengedag-v2-restore-perfect-ui",
-  "version": "2.2.1",
+  "name": "pengedag-v2-salary-id-column-fix",
+  "version": "2.2.2",
   "type": "module",
   "scripts": {
     "start": "node server.js"
