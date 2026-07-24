@@ -9,8 +9,8 @@ import nodemailer from "nodemailer";
 
 const { Pool } = pkg;
 const app = express();
-const VERSION = "2.2.2-salary-id-column-fix";
-console.log("### PENGEDAG SERVER.JS 2.2.2 SALARY ID COLUMN FIX LOADED ###");
+const VERSION = "2.2.3-pretty-payslip-pdf";
+console.log("### PENGEDAG SERVER.JS 2.2.3 PRETTY PAYSLIP PDF LOADED ###");
 
 const PORT = process.env.PORT || 8080;
 const JWT_SECRET = process.env.JWT_SECRET || "pengedag-dev-secret-change-me";
@@ -181,7 +181,7 @@ async function audit(user,action,type,id,details={}){
 }
 
 app.get("/health",async(req,res)=>{
-  try{ await ensure(); await q("SELECT 1"); res.json({ok:true,status:"healthy",version:VERSION,marker:"SALARY_ID_FIX_2_2_2",database:"connected",time:new Date().toISOString()}); }
+  try{ await ensure(); await q("SELECT 1"); res.json({ok:true,status:"healthy",version:VERSION,marker:"PRETTY_PAYSLIP_PDF_2_2_3",database:"connected",time:new Date().toISOString()}); }
   catch(e){ res.status(500).json({ok:false,status:"unhealthy",version:VERSION,error:e.message}); }
 });
 
@@ -301,13 +301,107 @@ app.post("/api/admin/payroll/calculate",auth("admin"),async(req,res)=>{
   }catch(e){ res.status(500).json({ok:false,error:"Kunne ikke beregne løn",details:e.message,code:e.code||null}); }
 });
 
+
+function drawBox(doc, x, y, w, h, title, value, color="#111827"){
+  doc.roundedRect(x,y,w,h,12).fillAndStroke("#F8FAFC","#E5E7EB");
+  doc.fillColor("#6B7280").fontSize(8).text(title,x+12,y+10,{width:w-24});
+  doc.fillColor(color).fontSize(13).font("Helvetica-Bold").text(String(value),x+12,y+27,{width:w-24});
+  doc.font("Helvetica");
+}
+
+function drawRow(doc, label, value, x, y, w){
+  doc.fillColor("#6B7280").fontSize(9).text(label,x,y,{width:w/2});
+  doc.fillColor("#111827").fontSize(9).font("Helvetica-Bold").text(String(value),x+w/2,y,{width:w/2,align:"right"});
+  doc.font("Helvetica");
+  doc.moveTo(x,y+15).lineTo(x+w,y+15).strokeColor("#E5E7EB").lineWidth(0.6).stroke();
+}
+
 function createPdf(p){
   return new Promise((resolve,reject)=>{
-    const doc=new PDFDocument({margin:44,size:"A4"}), chunks=[];
-    doc.on("data",d=>chunks.push(d)); doc.on("end",()=>resolve(Buffer.concat(chunks))); doc.on("error",reject);
-    doc.fontSize(24).text("Pengedag"); doc.fontSize(16).text("Lønseddel"); doc.moveDown();
-    doc.fontSize(10).text(`Periode: ${p.periodStart} - ${p.periodEnd}`); doc.text(`Medarbejder: ${p.employeeName||p.employeeId}`); doc.moveDown();
-    [["Timer i alt",p.totalHours],["Bruttoløn",`${p.grossSalary} kr.`],["Pension medarbejder",`${p.pensionEmployee} kr.`],["Pension arbejdsgiver",`${p.pensionEmployer} kr.`],["AM-bidrag",`${p.amBidrag} kr.`],["Skat",`${p.taxAmount} kr.`],["Netto",`${p.netSalary} kr.`]].forEach(([a,b])=>doc.text(`${a}: ${b}`));
+    const doc=new PDFDocument({margin:0,size:"A4"});
+    const chunks=[];
+    doc.on("data",d=>chunks.push(d));
+    doc.on("end",()=>resolve(Buffer.concat(chunks)));
+    doc.on("error",reject);
+
+    const pageW=595.28;
+    const pageH=841.89;
+    const margin=42;
+
+    // Background
+    doc.rect(0,0,pageW,pageH).fill("#F5F7FB");
+
+    // Header card
+    doc.roundedRect(margin,32,pageW-margin*2,112,22).fillAndStroke("#FFFFFF","#E5E7EB");
+
+    // Logo mark
+    doc.roundedRect(margin+22,54,58,58,16).fill("#2563EB");
+    doc.fillColor("#FFFFFF").fontSize(34).font("Helvetica-Bold").text("P",margin+39,66);
+    doc.font("Helvetica");
+
+    doc.fillColor("#111827").fontSize(24).font("Helvetica-Bold").text("Pengedag",margin+96,58);
+    doc.fillColor("#6B7280").fontSize(10).font("Helvetica").text("Lønseddel og lønoverblik",margin+98,88);
+    doc.fillColor("#2563EB").fontSize(9).text("Digital hjælper til timer, løn og rapporter",margin+98,106);
+
+    doc.fillColor("#111827").fontSize(18).font("Helvetica-Bold").text("LØNSEDDEL",pageW-margin-170,59,{width:150,align:"right"});
+    doc.fillColor("#6B7280").fontSize(9).font("Helvetica").text(`Periode: ${p.periodStart} - ${p.periodEnd}`,pageW-margin-220,86,{width:200,align:"right"});
+    doc.text(`Oprettet: ${new Date().toISOString().slice(0,10)}`,pageW-margin-220,103,{width:200,align:"right"});
+
+    // Employee info
+    doc.roundedRect(margin,164,pageW-margin*2,70,18).fillAndStroke("#FFFFFF","#E5E7EB");
+    doc.fillColor("#6B7280").fontSize(9).text("Medarbejder",margin+20,182);
+    doc.fillColor("#111827").fontSize(14).font("Helvetica-Bold").text(p.employeeName||p.employeeId,margin+20,199);
+    doc.font("Helvetica").fillColor("#6B7280").fontSize(9).text(`Medarbejder-ID: ${p.employeeId}`,margin+20,216);
+    doc.fillColor("#16A34A").fontSize(10).font("Helvetica-Bold").text("Godkendt løngrundlag",pageW-margin-190,190,{width:170,align:"right"});
+    doc.font("Helvetica").fillColor("#6B7280").fontSize(9).text(`${p.approvedEntries||0} godkendte poster`,pageW-margin-190,209,{width:170,align:"right"});
+
+    // KPI boxes
+    const boxY=254, boxW=(pageW-margin*2-24)/3;
+    drawBox(doc,margin,boxY,boxW,62,"Timer i alt",Number(p.totalHours||0).toFixed(2),"#2563EB");
+    drawBox(doc,margin+boxW+12,boxY,boxW,62,"Bruttoløn",`${Number(p.grossSalary||0).toFixed(2)} kr.`,"#111827");
+    drawBox(doc,margin+(boxW+12)*2,boxY,boxW,62,"Netto udbetaling",`${Number(p.netSalary||0).toFixed(2)} kr.`,"#16A34A");
+
+    // Salary details
+    const leftX=margin, rightX=pageW/2+10, cardY=342;
+    doc.roundedRect(leftX,cardY,245,230,18).fillAndStroke("#FFFFFF","#E5E7EB");
+    doc.roundedRect(rightX,cardY,245,230,18).fillAndStroke("#FFFFFF","#E5E7EB");
+
+    doc.fillColor("#111827").fontSize(14).font("Helvetica-Bold").text("Lønberegning",leftX+18,cardY+18);
+    doc.font("Helvetica");
+    let y=cardY+48;
+    [
+      ["Normal timer", Number(p.normalHours||0).toFixed(2)],
+      ["Overtid timer", Number(p.overtimeHours||0).toFixed(2)],
+      ["Normal sats", `${Number(p.normalRate||0).toFixed(2)} kr.`],
+      ["Overtidssats", `${Number(p.overtimeRate||0).toFixed(2)} kr.`],
+      ["Bruttoløn", `${Number(p.grossSalary||0).toFixed(2)} kr.`]
+    ].forEach(([a,b])=>{ drawRow(doc,a,b,leftX+18,y,209); y+=28; });
+
+    doc.fillColor("#111827").fontSize(14).font("Helvetica-Bold").text("Fradrag og pension",rightX+18,cardY+18);
+    doc.font("Helvetica");
+    y=cardY+48;
+    [
+      ["Pension medarbejder", `${Number(p.pensionEmployee||0).toFixed(2)} kr.`],
+      ["Pension arbejdsgiver", `${Number(p.pensionEmployer||0).toFixed(2)} kr.`],
+      ["AM-bidrag", `${Number(p.amBidrag||0).toFixed(2)} kr.`],
+      ["Skat", `${Number(p.taxAmount||0).toFixed(2)} kr.`],
+      ["Netto", `${Number(p.netSalary||0).toFixed(2)} kr.`]
+    ].forEach(([a,b],i)=>{ drawRow(doc,a,b,rightX+18,y,209); y+=28; });
+
+    // Business summary
+    doc.roundedRect(margin,594,pageW-margin*2,86,18).fillAndStroke("#FFFFFF","#E5E7EB");
+    doc.fillColor("#111827").fontSize(14).font("Helvetica-Bold").text("Virksomhedsoverblik",margin+18,613);
+    doc.font("Helvetica");
+    drawRow(doc,"Kundeomsætning",`${Number(p.revenue||0).toFixed(2)} kr.`,margin+18,642,220);
+    drawRow(doc,"Margin",`${Number(p.margin||0).toFixed(2)} kr.`,pageW-margin-238,642,220);
+
+    // Footer / disclaimer
+    doc.fillColor("#6B7280").fontSize(8).text(
+      "Pengedag er en digital hjælper til timer, godkendelse, lønsedler og regnskabsforberedelse. Lokal regnskabshjælper – ikke godkendt bogføringssystem.",
+      margin, pageH-78, {width:pageW-margin*2,align:"center"}
+    );
+    doc.fillColor("#9CA3AF").fontSize(8).text("pengedag.dk",margin,pageH-50,{width:pageW-margin*2,align:"center"});
+
     doc.end();
   });
 }
@@ -339,7 +433,7 @@ app.get("/api/admin/reports/summary",auth("admin"),async(req,res)=>{
 });
 
 app.get("/api/debug/salary-settings",auth("admin"),async(req,res)=>{
-  try{ await ensure(); const r=await q(`SELECT * FROM pd_salary_settings ORDER BY updated_at DESC LIMIT 50`); res.json({ok:true,version:VERSION,marker:"SALARY_ID_FIX_2_2_2",source:"pd_salary_settings",count:r.rows.length,rows:r.rows}); }
+  try{ await ensure(); const r=await q(`SELECT * FROM pd_salary_settings ORDER BY updated_at DESC LIMIT 50`); res.json({ok:true,version:VERSION,marker:"PRETTY_PAYSLIP_PDF_2_2_3",source:"pd_salary_settings",count:r.rows.length,rows:r.rows}); }
   catch(e){ res.status(500).json({ok:false,error:e.message,code:e.code||null}); }
 });
 

@@ -1,6 +1,6 @@
 {
-  "name": "pengedag-v2-salary-id-column-fix",
-  "version": "2.2.2",
+  "name": "pengedag-v2-pretty-payslip-pdf",
+  "version": "2.2.3",
   "type": "module",
   "scripts": {
     "start": "node server.js"
