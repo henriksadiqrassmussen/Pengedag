@@ -1,6 +1,6 @@
 {
-  "name": "pengedag-v2-resend-email-api",
-  "version": "2.2.5",
+  "name": "pengedag-v2-audit-safe-fix",
+  "version": "2.2.6",
   "type": "module",
   "scripts": {
     "start": "node server.js"

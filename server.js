@@ -9,8 +9,8 @@ import nodemailer from "nodemailer";
 
 const { Pool } = pkg;
 const app = express();
-const VERSION = "2.2.5-resend-email-api";
-console.log("### PENGEDAG SERVER.JS 2.2.5 RESEND EMAIL API LOADED ###");
+const VERSION = "2.2.6-audit-safe-fix";
+console.log("### PENGEDAG SERVER.JS 2.2.6 AUDIT SAFE FIX LOADED ###");
 
 const PORT = process.env.PORT || 8080;
 const JWT_SECRET = process.env.JWT_SECRET || "pengedag-dev-secret-change-me";
@@ -175,13 +175,59 @@ function auth(role=null){
   };
 }
 
-async function audit(user,action,type,id,details={}){
-  try{ await q(`INSERT INTO audit_log (id,actor_email,action,target_type,target_id,details) VALUES ($1,$2,$3,$4,$5,$6)`,[uid("audit"),user?.email||"",action,type,id,details]); }
-  catch(e){ console.error("audit ignored",e.message); }
+async function audit(user, action, entityType, entityId, metadata = {}) {
+  // Audit må aldrig stoppe løn, PDF eller email.
+  // Nogle ældre databaser har audit_log.id som BIGINT, derfor indsætter vi ikke tekst-id i id-kolonnen.
+  try {
+    const actorId = user?.id || user?.sub || "system";
+    const safeEntityId = String(entityId ?? "");
+    const safeMetadata = JSON.stringify(metadata ?? {});
+
+    await q(`
+      CREATE TABLE IF NOT EXISTS audit_log (
+        id BIGSERIAL PRIMARY KEY,
+        actor_id TEXT,
+        action TEXT,
+        entity_type TEXT,
+        entity_id TEXT,
+        metadata JSONB DEFAULT '{}'::jsonb,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    const cols = await q(`
+      SELECT column_name, data_type
+      FROM information_schema.columns
+      WHERE table_name = 'audit_log'
+    `);
+
+    const names = new Set(cols.rows.map(r => r.column_name));
+
+    if (names.has("actor_id") && names.has("entity_type") && names.has("entity_id") && names.has("metadata")) {
+      await q(
+        `INSERT INTO audit_log (actor_id, action, entity_type, entity_id, metadata)
+         VALUES ($1,$2,$3,$4,$5::jsonb)`,
+        [String(actorId), String(action), String(entityType), safeEntityId, safeMetadata]
+      );
+      return;
+    }
+
+    // Fallback til meget gamle skemaer
+    if (names.has("user_id") && names.has("action")) {
+      await q(
+        `INSERT INTO audit_log (user_id, action, details)
+         VALUES ($1,$2,$3)`,
+        [String(actorId), String(action), safeMetadata]
+      );
+      return;
+    }
+  } catch (e) {
+    console.warn("audit ignored", e.message);
+  }
 }
 
 app.get("/health",async(req,res)=>{
-  try{ await ensure(); await q("SELECT 1"); res.json({ok:true,status:"healthy",version:VERSION,marker:"RESEND_EMAIL_API_2_2_5",database:"connected",time:new Date().toISOString()}); }
+  try{ await ensure(); await q("SELECT 1"); res.json({ok:true,status:"healthy",version:VERSION,marker:"AUDIT_SAFE_FIX_2_2_6",database:"connected",time:new Date().toISOString()}); }
   catch(e){ res.status(500).json({ok:false,status:"unhealthy",version:VERSION,error:e.message}); }
 });
 
@@ -593,7 +639,7 @@ app.get("/api/admin/email/status", auth("admin"), async (req,res) => {
       ready:resendReady() || smtpReady(),
       mode:emailMode(),
       version:VERSION,
-      marker:"RESEND_EMAIL_API_2_2_5",
+      marker:"AUDIT_SAFE_FIX_2_2_6",
       resendReady:resendReady(),
       smtp:smtpConfigPublic()
     });
@@ -644,7 +690,7 @@ app.get("/api/debug/email-status", auth("admin"), async (req,res) => {
   res.json({
     ok:true,
     version:VERSION,
-    marker:"RESEND_EMAIL_API_2_2_5",
+    marker:"AUDIT_SAFE_FIX_2_2_6",
     ready:resendReady() || smtpReady(),
     mode:emailMode(),
     resendReady:resendReady(),
@@ -661,7 +707,7 @@ app.get("/api/admin/reports/summary",auth("admin"),async(req,res)=>{
 });
 
 app.get("/api/debug/salary-settings",auth("admin"),async(req,res)=>{
-  try{ await ensure(); const r=await q(`SELECT * FROM pd_salary_settings ORDER BY updated_at DESC LIMIT 50`); res.json({ok:true,version:VERSION,marker:"RESEND_EMAIL_API_2_2_5",source:"pd_salary_settings",count:r.rows.length,rows:r.rows}); }
+  try{ await ensure(); const r=await q(`SELECT * FROM pd_salary_settings ORDER BY updated_at DESC LIMIT 50`); res.json({ok:true,version:VERSION,marker:"AUDIT_SAFE_FIX_2_2_6",source:"pd_salary_settings",count:r.rows.length,rows:r.rows}); }
   catch(e){ res.status(500).json({ok:false,error:e.message,code:e.code||null}); }
 });
 
