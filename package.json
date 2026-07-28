@@ -1,6 +1,6 @@
 {
-  "name": "pengedag-v2-pretty-payslip-pdf",
-  "version": "2.2.3",
+  "name": "pengedag-v2-real-email-payslip-attachment",
+  "version": "2.2.4",
   "type": "module",
   "scripts": {
     "start": "node server.js"

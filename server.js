@@ -9,8 +9,8 @@ import nodemailer from "nodemailer";
 
 const { Pool } = pkg;
 const app = express();
-const VERSION = "2.2.3-pretty-payslip-pdf";
-console.log("### PENGEDAG SERVER.JS 2.2.3 PRETTY PAYSLIP PDF LOADED ###");
+const VERSION = "2.2.4-real-email-payslip-attachment";
+console.log("### PENGEDAG SERVER.JS 2.2.4 REAL EMAIL PAYSLIP ATTACHMENT LOADED ###");
 
 const PORT = process.env.PORT || 8080;
 const JWT_SECRET = process.env.JWT_SECRET || "pengedag-dev-secret-change-me";
@@ -181,7 +181,7 @@ async function audit(user,action,type,id,details={}){
 }
 
 app.get("/health",async(req,res)=>{
-  try{ await ensure(); await q("SELECT 1"); res.json({ok:true,status:"healthy",version:VERSION,marker:"PRETTY_PAYSLIP_PDF_2_2_3",database:"connected",time:new Date().toISOString()}); }
+  try{ await ensure(); await q("SELECT 1"); res.json({ok:true,status:"healthy",version:VERSION,marker:"REAL_EMAIL_PAYSLIP_ATTACHMENT_2_2_4",database:"connected",time:new Date().toISOString()}); }
   catch(e){ res.status(500).json({ok:false,status:"unhealthy",version:VERSION,error:e.message}); }
 });
 
@@ -416,13 +416,183 @@ app.post("/api/admin/payslip/pdf",auth("admin"),async(req,res)=>{
   }catch(e){ res.status(500).json({ok:false,error:"Kunne ikke lave PDF",details:e.message}); }
 });
 
-app.post("/api/admin/payslip/email",auth("admin"),async(req,res)=>{
-  try{
-    if(!process.env.SMTP_HOST) return res.json({ok:true,simulated:true,message:"Email simuleret. SMTP er ikke sat op endnu."});
-    const transporter=nodemailer.createTransport({host:process.env.SMTP_HOST,port:Number(process.env.SMTP_PORT||587),secure:String(process.env.SMTP_SECURE||"false")==="true",auth:{user:process.env.SMTP_USER,pass:process.env.SMTP_PASS}});
-    await transporter.sendMail({from:process.env.SMTP_FROM||process.env.SMTP_USER,to:req.body.to||"medarbejder@pengedag.dk",subject:"Din lønseddel fra Pengedag",text:"Din lønseddel er klar i Pengedag."});
-    res.json({ok:true,message:"Email sendt"});
-  }catch(e){ res.status(500).json({ok:false,error:"Kunne ikke sende email",details:e.message}); }
+
+function smtpReady(){
+  return !!(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS);
+}
+
+function smtpConfigPublic(){
+  return {
+    smtpHostSet: !!process.env.SMTP_HOST,
+    smtpPort: Number(process.env.SMTP_PORT || 587),
+    smtpUserSet: !!process.env.SMTP_USER,
+    smtpPassSet: !!process.env.SMTP_PASS,
+    smtpFrom: process.env.SMTP_FROM || process.env.SMTP_USER || "",
+    smtpSecure: String(process.env.SMTP_SECURE || "false") === "true"
+  };
+}
+
+function createTransporter(){
+  return nodemailer.createTransport({
+    host: process.env.SMTP_HOST,
+    port: Number(process.env.SMTP_PORT || 587),
+    secure: String(process.env.SMTP_SECURE || "false") === "true",
+    auth: {
+      user: process.env.SMTP_USER,
+      pass: process.env.SMTP_PASS
+    },
+    tls: {
+      rejectUnauthorized: String(process.env.SMTP_REJECT_UNAUTHORIZED || "true") !== "false"
+    }
+  });
+}
+
+app.post("/api/admin/payslip/email", auth("admin"), async (req,res) => {
+  try {
+    const employeeId = String(req.body.employeeId || req.body.calculation?.employeeId || "TEST001");
+    const period = String(req.body.period || req.body.calculation?.period || new Date().toISOString().slice(0,7));
+    const to = String(req.body.to || req.body.email || "medarbejder@pengedag.dk").trim();
+
+    if (!to || !to.includes("@")) {
+      return res.status(400).json({ ok:false, error:"Mangler gyldig email-modtager" });
+    }
+
+    const calculation = req.body.calculation || await calculatePayroll(employeeId, period);
+    const pdfBuffer = await createPdf(calculation);
+    const filename = `loenseddel-${calculation.employeeId}-${calculation.period}.pdf`;
+
+    if (!smtpReady()) {
+      await audit(req.user, "SIMULATE_PAYSLIP_EMAIL", "payslip", `${employeeId}-${period}`, {
+        to,
+        employeeId,
+        period,
+        filename,
+        smtp: smtpConfigPublic()
+      });
+      return res.json({
+        ok:true,
+        simulated:true,
+        message:"Email simuleret. SMTP er ikke sat op endnu.",
+        attachment:{ filename, bytes:pdfBuffer.length },
+        smtp:smtpConfigPublic()
+      });
+    }
+
+    const transporter = createTransporter();
+    await transporter.verify();
+
+    const from = process.env.SMTP_FROM || process.env.SMTP_USER;
+    const subject = req.body.subject || `Din lønseddel fra Pengedag - ${calculation.period}`;
+
+    const text = req.body.text || `Hej ${calculation.employeeName || ""}
+
+Din lønseddel for perioden ${calculation.periodStart} - ${calculation.periodEnd} er vedhæftet som PDF.
+
+Venlig hilsen
+Pengedag`;
+
+    const html = req.body.html || `
+      <div style="font-family:Segoe UI,Arial,sans-serif;color:#111827;line-height:1.5">
+        <h2 style="color:#2563EB;margin-bottom:8px">Pengedag</h2>
+        <p>Hej ${calculation.employeeName || ""}</p>
+        <p>Din lønseddel for perioden <strong>${calculation.periodStart} - ${calculation.periodEnd}</strong> er vedhæftet som PDF.</p>
+        <div style="background:#F5F7FB;border:1px solid #E5E7EB;border-radius:14px;padding:14px;margin:14px 0">
+          <p><strong>Timer:</strong> ${Number(calculation.totalHours || 0).toFixed(2)}</p>
+          <p><strong>Bruttoløn:</strong> ${Number(calculation.grossSalary || 0).toFixed(2)} kr.</p>
+          <p><strong>Netto:</strong> ${Number(calculation.netSalary || 0).toFixed(2)} kr.</p>
+        </div>
+        <p>Venlig hilsen<br><strong>Pengedag</strong></p>
+      </div>
+    `;
+
+    const info = await transporter.sendMail({
+      from,
+      to,
+      subject,
+      text,
+      html,
+      attachments: [
+        {
+          filename,
+          content: pdfBuffer,
+          contentType: "application/pdf"
+        }
+      ]
+    });
+
+    await audit(req.user, "SEND_PAYSLIP_EMAIL", "payslip", `${employeeId}-${period}`, {
+      to,
+      employeeId,
+      period,
+      filename,
+      messageId: info.messageId || "",
+      accepted: info.accepted || [],
+      rejected: info.rejected || []
+    });
+
+    res.json({
+      ok:true,
+      simulated:false,
+      message:"Email sendt med lønseddel som PDF",
+      to,
+      attachment:{ filename, bytes:pdfBuffer.length },
+      messageId: info.messageId || null,
+      accepted: info.accepted || [],
+      rejected: info.rejected || []
+    });
+  } catch(e) {
+    console.error("PAYSLIP_EMAIL_ERROR", e);
+    res.status(500).json({
+      ok:false,
+      error:"Kunne ikke sende email",
+      details:e.message,
+      smtp:smtpConfigPublic()
+    });
+  }
+});
+
+app.get("/api/admin/email/status", auth("admin"), async (req,res) => {
+  try {
+    res.json({
+      ok:true,
+      ready:smtpReady(),
+      version:VERSION,
+      marker:"REAL_EMAIL_PAYSLIP_ATTACHMENT_2_2_4",
+      smtp:smtpConfigPublic()
+    });
+  } catch(e) {
+    res.status(500).json({ ok:false, error:"Kunne ikke hente email-status", details:e.message });
+  }
+});
+
+app.post("/api/admin/email/test", auth("admin"), async (req,res) => {
+  try {
+    const to = String(req.body.to || process.env.SMTP_TEST_TO || "medarbejder@pengedag.dk").trim();
+    if (!smtpReady()) {
+      return res.json({
+        ok:true,
+        simulated:true,
+        message:"Email test simuleret. SMTP mangler.",
+        smtp:smtpConfigPublic()
+      });
+    }
+
+    const transporter = createTransporter();
+    await transporter.verify();
+
+    const info = await transporter.sendMail({
+      from: process.env.SMTP_FROM || process.env.SMTP_USER,
+      to,
+      subject:"Pengedag email-test",
+      text:"Dette er en test fra Pengedag backend. SMTP virker."
+    });
+
+    await audit(req.user, "SEND_TEST_EMAIL", "email", to, { messageId:info.messageId || "" });
+    res.json({ ok:true, simulated:false, message:"Test-email sendt", messageId:info.messageId || null });
+  } catch(e) {
+    console.error("TEST_EMAIL_ERROR", e);
+    res.status(500).json({ ok:false, error:"Kunne ikke sende test-email", details:e.message, smtp:smtpConfigPublic() });
+  }
 });
 
 app.get("/api/admin/reports/summary",auth("admin"),async(req,res)=>{
@@ -433,8 +603,19 @@ app.get("/api/admin/reports/summary",auth("admin"),async(req,res)=>{
 });
 
 app.get("/api/debug/salary-settings",auth("admin"),async(req,res)=>{
-  try{ await ensure(); const r=await q(`SELECT * FROM pd_salary_settings ORDER BY updated_at DESC LIMIT 50`); res.json({ok:true,version:VERSION,marker:"PRETTY_PAYSLIP_PDF_2_2_3",source:"pd_salary_settings",count:r.rows.length,rows:r.rows}); }
+  try{ await ensure(); const r=await q(`SELECT * FROM pd_salary_settings ORDER BY updated_at DESC LIMIT 50`); res.json({ok:true,version:VERSION,marker:"REAL_EMAIL_PAYSLIP_ATTACHMENT_2_2_4",source:"pd_salary_settings",count:r.rows.length,rows:r.rows}); }
   catch(e){ res.status(500).json({ok:false,error:e.message,code:e.code||null}); }
+});
+
+
+app.get("/api/debug/email-status", auth("admin"), async (req,res) => {
+  res.json({
+    ok:true,
+    version:VERSION,
+    marker:"REAL_EMAIL_PAYSLIP_ATTACHMENT_2_2_4",
+    ready:smtpReady(),
+    smtp:smtpConfigPublic()
+  });
 });
 
 seed().then(()=>app.listen(PORT,()=>console.log(`Pengedag backend ${VERSION} on port ${PORT}`))).catch(err=>{
