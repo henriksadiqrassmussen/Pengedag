@@ -1,6 +1,6 @@
 {
-  "name": "pengedag-v2-real-email-payslip-attachment",
-  "version": "2.2.4",
+  "name": "pengedag-v2-resend-email-api",
+  "version": "2.2.5",
   "type": "module",
   "scripts": {
     "start": "node server.js"
