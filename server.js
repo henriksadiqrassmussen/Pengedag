@@ -9,8 +9,8 @@ import nodemailer from "nodemailer";
 
 const { Pool } = pkg;
 const app = express();
-const VERSION = "2.2.6-audit-safe-fix";
-console.log("### PENGEDAG SERVER.JS 2.2.6 AUDIT SAFE FIX LOADED ###");
+const VERSION = "2.2.7-employees-online";
+console.log("### PENGEDAG SERVER.JS 2.2.7 EMPLOYEES ONLINE LOADED ###");
 
 const PORT = process.env.PORT || 8080;
 const JWT_SECRET = process.env.JWT_SECRET || "pengedag-dev-secret-change-me";
@@ -130,6 +130,26 @@ async function ensure(){
     details JSONB,
     created_at TIMESTAMPTZ DEFAULT NOW()
   )`);
+
+    await q(`
+      CREATE TABLE IF NOT EXISTS pd_employees (
+        employee_id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        email TEXT,
+        phone TEXT,
+        hourly_rate NUMERIC DEFAULT 160,
+        customer_rate NUMERIC DEFAULT 320,
+        status TEXT DEFAULT 'Aktiv',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    await q(`
+      INSERT INTO pd_employees (employee_id, name, email, phone, hourly_rate, customer_rate, status)
+      VALUES ('TEST001','Test Medarbejder','vault1973@gmail.com','',160,320,'Aktiv')
+      ON CONFLICT (employee_id) DO NOTHING
+    `);
   await q(`ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS details JSONB`);
 }
 
@@ -227,7 +247,7 @@ async function audit(user, action, entityType, entityId, metadata = {}) {
 }
 
 app.get("/health",async(req,res)=>{
-  try{ await ensure(); await q("SELECT 1"); res.json({ok:true,status:"healthy",version:VERSION,marker:"AUDIT_SAFE_FIX_2_2_6",database:"connected",time:new Date().toISOString()}); }
+  try{ await ensure(); await q("SELECT 1"); res.json({ok:true,status:"healthy",version:VERSION,marker:"EMPLOYEES_ONLINE_2_2_7",database:"connected",time:new Date().toISOString()}); }
   catch(e){ res.status(500).json({ok:false,status:"unhealthy",version:VERSION,error:e.message}); }
 });
 
@@ -278,6 +298,111 @@ app.post("/api/mobile/time-entries/:id/approve",auth("admin"),async(req,res)=>{
     await audit(req.user,"APPROVE_TIME_ENTRY","pd_time_entry",req.params.id,{});
     res.json({ok:true,entry:r.rows[0]});
   }catch(e){ res.status(500).json({ok:false,error:"Kunne ikke godkende time",details:e.message,code:e.code||null}); }
+});
+
+
+function employeeFromRow(r){
+  return {
+    employeeId: r.employee_id,
+    name: r.name,
+    email: r.email || "",
+    phone: r.phone || "",
+    hourlyRate: Number(r.hourly_rate || 0),
+    customerRate: Number(r.customer_rate || 0),
+    status: r.status || "Aktiv",
+    createdAt: r.created_at,
+    updatedAt: r.updated_at
+  };
+}
+
+app.get("/api/admin/employees", auth("admin"), async (req,res) => {
+  try {
+    const rows = await q(`
+      SELECT employee_id, name, email, phone, hourly_rate, customer_rate, status, created_at, updated_at
+      FROM pd_employees
+      ORDER BY employee_id ASC
+    `);
+    res.json({ ok:true, employees: rows.rows.map(employeeFromRow) });
+  } catch(e) {
+    console.error("GET_EMPLOYEES_ERROR", e);
+    res.status(500).json({ ok:false, error:"Kunne ikke hente medarbejdere", details:e.message });
+  }
+});
+
+app.get("/api/admin/employees/:employeeId", auth("admin"), async (req,res) => {
+  try {
+    const employeeId = String(req.params.employeeId || "");
+    const rows = await q(`
+      SELECT employee_id, name, email, phone, hourly_rate, customer_rate, status, created_at, updated_at
+      FROM pd_employees
+      WHERE employee_id=$1
+    `, [employeeId]);
+    if(!rows.rows[0]) return res.status(404).json({ ok:false, error:"Medarbejder ikke fundet" });
+    res.json({ ok:true, employee: employeeFromRow(rows.rows[0]) });
+  } catch(e) {
+    res.status(500).json({ ok:false, error:"Kunne ikke hente medarbejder", details:e.message });
+  }
+});
+
+app.post("/api/admin/employees", auth("admin"), async (req,res) => {
+  try {
+    const employeeId = String(req.body.employeeId || req.body.employee_id || "").trim();
+    const name = String(req.body.name || "").trim();
+    if(!employeeId) return res.status(400).json({ ok:false, error:"Medarbejder-ID mangler" });
+    if(!name) return res.status(400).json({ ok:false, error:"Navn mangler" });
+
+    const email = String(req.body.email || "").trim();
+    const phone = String(req.body.phone || "").trim();
+    const hourlyRate = Number(req.body.hourlyRate ?? req.body.hourly_rate ?? 160);
+    const customerRate = Number(req.body.customerRate ?? req.body.customer_rate ?? 320);
+    const status = String(req.body.status || "Aktiv");
+
+    const rows = await q(`
+      INSERT INTO pd_employees (employee_id, name, email, phone, hourly_rate, customer_rate, status, updated_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,CURRENT_TIMESTAMP)
+      ON CONFLICT (employee_id) DO UPDATE SET
+        name=EXCLUDED.name,
+        email=EXCLUDED.email,
+        phone=EXCLUDED.phone,
+        hourly_rate=EXCLUDED.hourly_rate,
+        customer_rate=EXCLUDED.customer_rate,
+        status=EXCLUDED.status,
+        updated_at=CURRENT_TIMESTAMP
+      RETURNING employee_id, name, email, phone, hourly_rate, customer_rate, status, created_at, updated_at
+    `, [employeeId, name, email, phone, hourlyRate, customerRate, status]);
+
+    await audit(req.user, "UPSERT_EMPLOYEE", "employee", employeeId, { email, hourlyRate, customerRate, status });
+    res.json({ ok:true, message:"Medarbejder gemt online", employee: employeeFromRow(rows.rows[0]) });
+  } catch(e) {
+    console.error("SAVE_EMPLOYEE_ERROR", e);
+    res.status(500).json({ ok:false, error:"Kunne ikke gemme medarbejder", details:e.message });
+  }
+});
+
+app.delete("/api/admin/employees/:employeeId", auth("admin"), async (req,res) => {
+  try {
+    const employeeId = String(req.params.employeeId || "");
+    await q(`DELETE FROM pd_employees WHERE employee_id=$1`, [employeeId]);
+    await audit(req.user, "DELETE_EMPLOYEE", "employee", employeeId, {});
+    res.json({ ok:true, message:"Medarbejder slettet online", employeeId });
+  } catch(e) {
+    console.error("DELETE_EMPLOYEE_ERROR", e);
+    res.status(500).json({ ok:false, error:"Kunne ikke slette medarbejder", details:e.message });
+  }
+});
+
+app.get("/api/employee/me", auth(), async (req,res) => {
+  try {
+    const employeeId = req.user.employeeId || req.user.employee_id || "TEST001";
+    const rows = await q(`
+      SELECT employee_id, name, email, phone, hourly_rate, customer_rate, status, created_at, updated_at
+      FROM pd_employees
+      WHERE employee_id=$1
+    `, [employeeId]);
+    res.json({ ok:true, employee: rows.rows[0] ? employeeFromRow(rows.rows[0]) : null });
+  } catch(e) {
+    res.status(500).json({ ok:false, error:"Kunne ikke hente medarbejderprofil", details:e.message });
+  }
 });
 
 app.get("/api/admin/employees/:employeeId/salary-settings",auth("admin"),async(req,res)=>{
@@ -639,7 +764,7 @@ app.get("/api/admin/email/status", auth("admin"), async (req,res) => {
       ready:resendReady() || smtpReady(),
       mode:emailMode(),
       version:VERSION,
-      marker:"AUDIT_SAFE_FIX_2_2_6",
+      marker:"EMPLOYEES_ONLINE_2_2_7",
       resendReady:resendReady(),
       smtp:smtpConfigPublic()
     });
@@ -690,7 +815,7 @@ app.get("/api/debug/email-status", auth("admin"), async (req,res) => {
   res.json({
     ok:true,
     version:VERSION,
-    marker:"AUDIT_SAFE_FIX_2_2_6",
+    marker:"EMPLOYEES_ONLINE_2_2_7",
     ready:resendReady() || smtpReady(),
     mode:emailMode(),
     resendReady:resendReady(),
@@ -707,7 +832,7 @@ app.get("/api/admin/reports/summary",auth("admin"),async(req,res)=>{
 });
 
 app.get("/api/debug/salary-settings",auth("admin"),async(req,res)=>{
-  try{ await ensure(); const r=await q(`SELECT * FROM pd_salary_settings ORDER BY updated_at DESC LIMIT 50`); res.json({ok:true,version:VERSION,marker:"AUDIT_SAFE_FIX_2_2_6",source:"pd_salary_settings",count:r.rows.length,rows:r.rows}); }
+  try{ await ensure(); const r=await q(`SELECT * FROM pd_salary_settings ORDER BY updated_at DESC LIMIT 50`); res.json({ok:true,version:VERSION,marker:"EMPLOYEES_ONLINE_2_2_7",source:"pd_salary_settings",count:r.rows.length,rows:r.rows}); }
   catch(e){ res.status(500).json({ok:false,error:e.message,code:e.code||null}); }
 });
 
