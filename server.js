@@ -329,6 +329,30 @@ app.get("/api/admin/employees", auth("admin"), async (req,res) => {
   }
 });
 
+
+app.post("/api/admin/employees/:employeeId/sync-salary", auth("admin"), async (req,res) => {
+  try {
+    const employeeId = String(req.params.employeeId || "");
+    const rows = await q(`
+      SELECT employee_id, hourly_rate, customer_rate
+      FROM pd_employees
+      WHERE employee_id=$1
+    `, [employeeId]);
+    if(!rows.rows[0]) return res.status(404).json({ ok:false, error:"Medarbejder ikke fundet" });
+
+    await syncEmployeeSalaryProfile(employeeId, Number(rows.rows[0].hourly_rate || 160), Number(rows.rows[0].customer_rate || 320));
+    await audit(req.user, "SYNC_EMPLOYEE_SALARY_PROFILE", "employee", employeeId, {
+      hourlyRate:Number(rows.rows[0].hourly_rate || 160),
+      customerRate:Number(rows.rows[0].customer_rate || 320)
+    });
+
+    res.json({ ok:true, message:"Lønprofil synkroniseret fra medarbejder-kartotek", employeeId });
+  } catch(e) {
+    console.error("SYNC_EMPLOYEE_SALARY_ERROR", e);
+    res.status(500).json({ ok:false, error:"Kunne ikke synkronisere lønprofil", details:e.message });
+  }
+});
+
 app.get("/api/admin/employees/:employeeId", auth("admin"), async (req,res) => {
   try {
     const employeeId = String(req.params.employeeId || "");
@@ -343,6 +367,29 @@ app.get("/api/admin/employees/:employeeId", auth("admin"), async (req,res) => {
     res.status(500).json({ ok:false, error:"Kunne ikke hente medarbejder", details:e.message });
   }
 });
+
+
+async function syncEmployeeSalaryProfile(employeeId, hourlyRate, customerRate){
+  // Holder medarbejder-kartotek og lønprofil samlet.
+  // Bruger den rene pd_salary_settings-tabel fra salary-id-fix versionen.
+  const existing = await q(`SELECT * FROM pd_salary_settings WHERE employee_id=$1`, [employeeId]);
+  if(existing.rows[0]){
+    await q(`
+      UPDATE pd_salary_settings
+      SET normal_rate=$2,
+          customer_rate=$3,
+          updated_at=CURRENT_TIMESTAMP
+      WHERE employee_id=$1
+    `, [employeeId, hourlyRate, customerRate]);
+  } else {
+    await q(`
+      INSERT INTO pd_salary_settings
+        (employee_id, normal_rate, overtime_rate, weekend_rate, customer_rate, pension_employee_pct, pension_employer_pct, am_pct, tax_pct, holiday_pct)
+      VALUES
+        ($1,$2,$3,$4,$5,4,4,8,37,12.5)
+    `, [employeeId, hourlyRate, Number(hourlyRate || 0) * 1.5, Number(hourlyRate || 0) * 1.5, customerRate]);
+  }
+}
 
 app.post("/api/admin/employees", auth("admin"), async (req,res) => {
   try {
@@ -371,8 +418,9 @@ app.post("/api/admin/employees", auth("admin"), async (req,res) => {
       RETURNING employee_id, name, email, phone, hourly_rate, customer_rate, status, created_at, updated_at
     `, [employeeId, name, email, phone, hourlyRate, customerRate, status]);
 
-    await audit(req.user, "UPSERT_EMPLOYEE", "employee", employeeId, { email, hourlyRate, customerRate, status });
-    res.json({ ok:true, message:"Medarbejder gemt online", employee: employeeFromRow(rows.rows[0]) });
+    await syncEmployeeSalaryProfile(employeeId, hourlyRate, customerRate);
+    await audit(req.user, "UPSERT_EMPLOYEE", "employee", employeeId, { email, hourlyRate, customerRate, status, salarySynced:true });
+    res.json({ ok:true, message:"Medarbejder gemt online og lønprofil synkroniseret", salarySynced:true, employee: employeeFromRow(rows.rows[0]) });
   } catch(e) {
     console.error("SAVE_EMPLOYEE_ERROR", e);
     res.status(500).json({ ok:false, error:"Kunne ikke gemme medarbejder", details:e.message });

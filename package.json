@@ -1,6 +1,6 @@
 {
-  "name": "pengedag-v2-employees-online",
-  "version": "2.2.7",
+  "name": "pengedag-v2-employee-salary-sync",
+  "version": "2.2.8",
   "type": "module",
   "scripts": {
     "start": "node server.js"
